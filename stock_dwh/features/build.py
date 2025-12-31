@@ -15,7 +15,13 @@ def build_features(fact_prices: pd.DataFrame, fact_news_scored: pd.DataFrame, as
 
     px = fact_prices.copy()
     px["ts_utc"] = pd.to_datetime(px["ts_utc"], utc=True)
-    px = px[px["ts_utc"] <= asof_ts].sort_values(["ticker","ts_utc"])
+    # px = px[px["ts_utc"] <= asof_ts].sort_values(["ticker","ts_utc"])
+    px = (
+    px[px["ts_utc"] <= asof_ts]
+    .sort_values(["ticker", "ts_utc"])
+    .groupby("ticker", as_index=False)
+    .tail(2)
+    )
 
     # last 2 per ticker
     last = px.groupby("ticker").tail(2)
