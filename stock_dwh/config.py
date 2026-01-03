@@ -53,7 +53,7 @@ def get_sources() -> Sources:
         news_github_csv_path=_env("NEWS_GITHUB_CSV_PATH", "data/news_data/historical_news.csv"),
         news_rss_urls=tuple(filter(None, _env("NEWS_RSS_URLS", "").split(","))),
         market_source=_env("MARKET_SOURCE", "csv"),
-        market_csv_path=_env("MARKET_CSV_PATH", "stock_dwh/data/market/ohlcv.csv"),
+        market_csv_path=_env("MARKET_CSV_PATH", "stock_dwh/Data/ohlcv.csv"),
     )
 
 @dataclass(frozen=True)
