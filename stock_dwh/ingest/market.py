@@ -1,69 +1,103 @@
 from __future__ import annotations
+
 import pandas as pd
+import yfinance as yf
 from pathlib import Path
-from datetime import timezone
-from ..utils.time import safe_parse_dt, dt_to_partition
+from datetime import datetime, timedelta, timezone
 
-def load_market_csv(csv_path: Path) -> pd.DataFrame:
-    """Load OHLCV from a CSV file.
+BRONZE_DIR = Path("warehouse/bronze/raw_prices")
 
-    Expected columns (case-insensitive):
-      - ticker OR symbol
-      - datetime OR timestamp OR date
-      - open, high, low, close, volume
-    """
-    df = pd.read_csv(csv_path)
-    colmap = {c.lower().strip(): c for c in df.columns}
-    def pick(*names):
-        for n in names:
-            if n in colmap:
-                return colmap[n]
-        return None
+# NIFTY 50 Yahoo Finance tickers
+NIFTY50 = [
+    "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS",
+    "LT.NS", "SBIN.NS", "AXISBANK.NS", "HINDUNILVR.NS", "ITC.NS",
+    "BAJFINANCE.NS", "BAJAJFINSV.NS", "KOTAKBANK.NS", "HCLTECH.NS",
+    "MARUTI.NS", "SUNPHARMA.NS", "NTPC.NS", "POWERGRID.NS",
+    "ONGC.NS", "TITAN.NS", "ULTRACEMCO.NS", "ADANIENT.NS",
+    "ADANIPORTS.NS", "COALINDIA.NS", "WIPRO.NS", "ASIANPAINT.NS",
+    "JSWSTEEL.NS", "TATAMOTORS.NS", "TATASTEEL.NS", "NESTLEIND.NS",
+    "BPCL.NS", "GRASIM.NS", "HDFCLIFE.NS", "SBILIFE.NS",
+    "DIVISLAB.NS", "BRITANNIA.NS", "HINDALCO.NS", "CIPLA.NS",
+    "DRREDDY.NS", "TECHM.NS", "HEROMOTOCO.NS", "EICHERMOT.NS",
+    "APOLLOHOSP.NS", "BAJAJ-AUTO.NS", "INDUSINDBK.NS",
+    "UPL.NS", "LTIM.NS", "SHRIRAMFIN.NS", "M&M.NS"
+]
 
-    t_c = pick("ticker", "symbol", "stock")
-    ts_c = pick("datetime", "timestamp", "date", "time")
-    o_c = pick("open", "o")
-    h_c = pick("high", "h")
-    l_c = pick("low", "l")
-    c_c = pick("close", "c")
-    v_c = pick("volume", "vol", "v")
+def fetch_ohlcv(
+    tickers: list[str],
+    start: str,
+    end: str
+) -> pd.DataFrame:
+    """Fetch OHLCV from Yahoo Finance"""
+    df = yf.download(
+        tickers=tickers,
+        start=start,
+        end=end,
+        interval="1d",
+        group_by="ticker",
+        auto_adjust=False,
+        threads=True
+    )
 
-    out = pd.DataFrame({
-        "ticker": df[t_c] if t_c else "",
-        "ts": df[ts_c] if ts_c else "",
-        "open": df[o_c] if o_c else None,
-        "high": df[h_c] if h_c else None,
-        "low": df[l_c] if l_c else None,
-        "close": df[c_c] if c_c else None,
-        "volume": df[v_c] if v_c else None,
-    })
-    # parse ts
-    pub, dt_part = [], []
-    for s in out["ts"].fillna("").astype(str).tolist():
-        d = safe_parse_dt(s)
-        if d is None:
-            pub.append(pd.NaT); dt_part.append(None)
-        else:
-            if d.tzinfo is None:
-                d = d.replace(tzinfo=timezone.utc)
-            d = d.astimezone(timezone.utc)
-            pub.append(d); dt_part.append(dt_to_partition(d))
-    out["ts_utc"] = pub
-    out["dt"] = dt_part
-    out = out.dropna(subset=["ts_utc"]).reset_index(drop=True)
-    return out
+    records = []
 
-def filter_incremental(df: pd.DataFrame, last_seen_ts: str | None) -> pd.DataFrame:
-    if df.empty or not last_seen_ts:
-        return df
-    try:
-        ts = pd.to_datetime(last_seen_ts, utc=True)
-        return df[df["ts_utc"] > ts].reset_index(drop=True)
-    except Exception:
-        return df
+    for ticker in tickers:
+        if ticker not in df.columns.levels[0]:
+            continue
 
-def update_last_seen(df: pd.DataFrame, last_seen_ts: str | None) -> str | None:
+        tdf = df[ticker].reset_index()
+        tdf.columns = [c.lower() for c in tdf.columns]
+        tdf["ticker"] = ticker.replace(".NS", "")
+        records.append(tdf)
+
+    if not records:
+        return pd.DataFrame()
+
+    return pd.concat(records, ignore_index=True)
+
+
+def run():
+    print("📈 Fetching NIFTY 50 daily OHLCV")
+
+    # Fetch last 2 years (safe demo default)
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=730)
+
+    df = fetch_ohlcv(
+        tickers=NIFTY50,
+        start=str(start),
+        end=str(end)
+    )
+
     if df.empty:
-        return last_seen_ts
-    mx = pd.to_datetime(df["ts_utc"], utc=True).max()
-    return mx.isoformat() if pd.notna(mx) else last_seen_ts
+        print("⚠️ No market data fetched")
+        return
+
+    # Normalize schema
+    df = df.rename(columns={
+        "date": "ts",
+        "adj close": "adj_close"
+    })
+
+    df["ts_utc"] = pd.to_datetime(df["ts"], utc=True)
+    df["dt"] = df["ts_utc"].dt.date
+
+    df = df[[
+        "ticker",
+        "ts",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "ts_utc",
+        "dt"
+    ]]
+
+    # Write partitioned parquet
+    for dt, part in df.groupby("dt"):
+        out = BRONZE_DIR / f"dt={dt}"
+        out.mkdir(parents=True, exist_ok=True)
+        part.to_parquet(out / "part.parquet", index=False)
+
+    print(f"✅ Ingested {df['ticker'].nunique()} stocks for {df['dt'].nunique()} days")
