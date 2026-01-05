@@ -6,8 +6,9 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 BRONZE_DIR = Path("warehouse/bronze/raw_prices")
+STATE_FILE = Path("warehouse/bronze/_market_last_seen.txt")
 
-# NIFTY 50 Yahoo Finance tickers
+# NIFTY 50 Yahoo tickers
 NIFTY50 = [
     "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS",
     "LT.NS", "SBIN.NS", "AXISBANK.NS", "HINDUNILVR.NS", "ITC.NS",
@@ -23,25 +24,30 @@ NIFTY50 = [
     "UPL.NS", "LTIM.NS", "SHRIRAMFIN.NS", "M&M.NS"
 ]
 
-def fetch_ohlcv(
-    tickers: list[str],
-    start: str,
-    end: str
-) -> pd.DataFrame:
-    """Fetch OHLCV from Yahoo Finance"""
+# -------------------------------------------------------------------
+# CLI EXPECTED FUNCTIONS (DO NOT REMOVE)
+# -------------------------------------------------------------------
+
+def load_market_csv() -> pd.DataFrame:
+    """
+    CLI entrypoint.
+    Replaced CSV logic with Yahoo Finance fetch.
+    """
+    end = datetime.now(timezone.utc).date()
+    start = get_last_seen() or (end - timedelta(days=730))
+
     df = yf.download(
-        tickers=tickers,
-        start=start,
-        end=end,
+        tickers=NIFTY50,
+        start=str(start),
+        end=str(end + timedelta(days=1)),
         interval="1d",
         group_by="ticker",
-        auto_adjust=False,
-        threads=True
+        threads=True,
+        auto_adjust=False
     )
 
     records = []
-
-    for ticker in tickers:
+    for ticker in NIFTY50:
         if ticker not in df.columns.levels[0]:
             continue
 
@@ -53,36 +59,13 @@ def fetch_ohlcv(
     if not records:
         return pd.DataFrame()
 
-    return pd.concat(records, ignore_index=True)
+    out = pd.concat(records, ignore_index=True)
 
+    out = out.rename(columns={"date": "ts"})
+    out["ts_utc"] = pd.to_datetime(out["ts"], utc=True)
+    out["dt"] = out["ts_utc"].dt.date
 
-def run():
-    print("📈 Fetching NIFTY 50 daily OHLCV")
-
-    # Fetch last 2 years (safe demo default)
-    end = datetime.now(timezone.utc).date()
-    start = end - timedelta(days=730)
-
-    df = fetch_ohlcv(
-        tickers=NIFTY50,
-        start=str(start),
-        end=str(end)
-    )
-
-    if df.empty:
-        print("⚠️ No market data fetched")
-        return
-
-    # Normalize schema
-    df = df.rename(columns={
-        "date": "ts",
-        "adj close": "adj_close"
-    })
-
-    df["ts_utc"] = pd.to_datetime(df["ts"], utc=True)
-    df["dt"] = df["ts_utc"].dt.date
-
-    df = df[[
+    return out[[
         "ticker",
         "ts",
         "open",
@@ -94,10 +77,49 @@ def run():
         "dt"
     ]]
 
-    # Write partitioned parquet
+
+def filter_incremental(df: pd.DataFrame) -> pd.DataFrame:
+    """No-op incremental filter (Yahoo already date bounded)"""
+    return df
+
+
+def update_last_seen(df: pd.DataFrame) -> None:
+    """Persist max ingested date"""
+    if df.empty:
+        return
+    last_dt = df["dt"].max()
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(str(last_dt))
+
+
+# -------------------------------------------------------------------
+# MAIN INGEST LOGIC (called by CLI)
+# -------------------------------------------------------------------
+
+def run():
+    df = load_market_csv()
+    df = filter_incremental(df)
+
+    if df.empty:
+        print("⚠️ No new market data")
+        return
+
     for dt, part in df.groupby("dt"):
         out = BRONZE_DIR / f"dt={dt}"
         out.mkdir(parents=True, exist_ok=True)
         part.to_parquet(out / "part.parquet", index=False)
 
-    print(f"✅ Ingested {df['ticker'].nunique()} stocks for {df['dt'].nunique()} days")
+    update_last_seen(df)
+
+    print(
+        f"✅ Ingested {df['ticker'].nunique()} stocks "
+        f"for {df['dt'].nunique()} days"
+    )
+
+
+# -------------------------------------------------------------------
+
+def get_last_seen():
+    if not STATE_FILE.exists():
+        return None
+    return pd.to_datetime(STATE_FILE.read_text()).date()
