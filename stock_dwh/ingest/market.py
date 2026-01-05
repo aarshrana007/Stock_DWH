@@ -30,42 +30,44 @@ NIFTY50 = [
 ]
 
 # =========================================================
-# CLI-EXPECTED FUNCTIONS (SIGNATURES MUST MATCH)
+# CLI EXPECTED FUNCTIONS (SIGNATURES MUST MATCH)
 # =========================================================
 
 def load_market_csv(mkt_path: str | Path) -> pd.DataFrame:
     """
-    CLI calls this with a CSV path.
-    We IGNORE the CSV and fetch live NIFTY 50 data instead.
+    CLI entrypoint.
+    CSV path is ignored; Yahoo Finance is used instead.
     """
     log.info("Loading market CSV: %s", mkt_path)
 
     end = datetime.now(timezone.utc).date()
     start = get_last_seen() or (end - timedelta(days=730))
 
-    df = yf.download(
-        tickers=NIFTY50,
-        start=str(start),
-        end=str(end + timedelta(days=1)),
-        interval="1d",
-        group_by="ticker",
-        auto_adjust=False,
-        threads=True
-    )
-
     records = []
 
-    if df.empty:
-        return pd.DataFrame()
-
     for ticker in NIFTY50:
-        if ticker not in df.columns.levels[0]:
-            continue
+        try:
+            df = yf.download(
+                ticker,
+                start=str(start),
+                end=str(end + timedelta(days=1)),
+                interval="1d",
+                auto_adjust=False,
+                progress=False
+            )
 
-        tdf = df[ticker].reset_index()
-        tdf.columns = [c.lower() for c in tdf.columns]
-        tdf["ticker"] = ticker.replace(".NS", "")
-        records.append(tdf)
+            if df.empty:
+                log.warning("No data for %s", ticker)
+                continue
+
+            df = df.reset_index()
+            df.columns = [c.lower() for c in df.columns]
+            df["ticker"] = ticker.replace(".NS", "")
+
+            records.append(df)
+
+        except Exception as e:
+            log.warning("Skipping %s due to error: %s", ticker, e)
 
     if not records:
         return pd.DataFrame()
@@ -89,31 +91,37 @@ def load_market_csv(mkt_path: str | Path) -> pd.DataFrame:
     ]]
 
 
-def filter_incremental(df: pd.DataFrame) -> pd.DataFrame:
+def filter_incremental(
+    df: pd.DataFrame,
+    last_seen_ts: pd.Timestamp | None
+) -> pd.DataFrame:
     """
-    CLI expects this.
-    Yahoo fetch already respects date range → no-op.
+    CLI passes last_seen_ts.
+    Filter rows strictly newer than last ingest.
     """
-    return df
+    if df.empty or last_seen_ts is None:
+        return df
+
+    return df[df["ts_utc"] > last_seen_ts]
 
 
 def update_last_seen(df: pd.DataFrame) -> None:
     """
-    Persist max ingested date for incremental runs.
+    Persist max ts_utc for next incremental run.
     """
     if df.empty:
         return
 
-    last_dt = df["dt"].max()
+    last_ts = df["ts_utc"].max()
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(str(last_dt))
+    STATE_FILE.write_text(last_ts.isoformat())
 
 
 # =========================================================
-# HELPER
+# HELPERS
 # =========================================================
 
 def get_last_seen():
     if not STATE_FILE.exists():
         return None
-    return pd.to_datetime(STATE_FILE.read_text()).date()
+    return pd.to_datetime(STATE_FILE.read_text(), utc=True)
