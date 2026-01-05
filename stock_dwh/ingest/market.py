@@ -5,13 +5,13 @@ import requests
 import zipfile
 import io
 from datetime import datetime, timedelta
-import logging
 from pathlib import Path
+import logging
 
 log = logging.getLogger(__name__)
 
 # --------------------------------------------------
-# NIFTY 50 symbols (NSE cash market)
+# NIFTY 50 symbols
 # --------------------------------------------------
 NIFTY50 = {
     "RELIANCE","TCS","INFY","HDFCBANK","ICICIBANK","LT","SBIN","AXISBANK",
@@ -30,61 +30,57 @@ NSE_URL = (
     "BhavCopy_NSE_CM_0_0_0_{date}_F_0000.csv.zip"
 )
 
-SESSION_HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-}
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # ==================================================
-# CLI EXPECTED FUNCTIONS (SIGNATURES MUST MATCH)
+# CLI EXPECTED FUNCTIONS
 # ==================================================
 
 def load_market_csv(mkt_path: str | Path) -> pd.DataFrame:
-    """
-    CLI entry point.
-    CSV path is ignored; NSE Bhavcopy is used instead.
-    """
     log.info("Loading market CSV: %s", mkt_path)
 
+    # 🔑 Incremental: only last 7 days (safe for holidays)
     end = datetime.today().date()
-    start = end - timedelta(days=365)
+    start = end - timedelta(days=7)
 
     session = requests.Session()
-    session.headers.update(SESSION_HEADERS)
+    session.headers.update(HEADERS)
 
     frames = []
 
     for day in daterange(start, end):
+        # Skip weekends
+        if day.weekday() >= 5:
+            continue
+
         try:
             url = NSE_URL.format(date=day.strftime("%Y%m%d"))
-            resp = session.get(url, timeout=20)
+            resp = session.get(url, timeout=10)
 
             if resp.status_code != 200:
                 continue
 
             with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-                name = zf.namelist()[0]
-                df = pd.read_csv(zf.open(name))
+                df = pd.read_csv(zf.open(zf.namelist()[0]))
 
-            df.columns = [c.lower() for c in df.columns]
+            # ✅ NSE uses UPPERCASE
+            df.columns = [c.upper() for c in df.columns]
 
-            # Filter EQ series + NIFTY 50
             df = df[
-                (df["series"] == "EQ") &
-                (df["symbol"].isin(NIFTY50))
+                (df["SERIES"] == "EQ") &
+                (df["SYMBOL"].isin(NIFTY50))
             ]
 
             if df.empty:
                 continue
 
             df = df.rename(columns={
-                "symbol": "ticker",
-                "open_price": "open",
-                "high_price": "high",
-                "low_price": "low",
-                "close_price": "close",
-                "ttl_trd_qnty": "volume",
+                "SYMBOL": "ticker",
+                "OPEN": "open",
+                "HIGH": "high",
+                "LOW": "low",
+                "CLOSE": "close",
+                "TTL_TRD_QNTY": "volume",
             })
 
             df["ts"] = pd.to_datetime(day)
@@ -104,23 +100,16 @@ def load_market_csv(mkt_path: str | Path) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
-def filter_incremental(
-    df: pd.DataFrame,
-    last_seen_ts: pd.Timestamp | None,
-) -> pd.DataFrame:
+def filter_incremental(df, last_seen_ts):
     if df.empty or last_seen_ts is None:
         return df
     return df[df["ts_utc"] > last_seen_ts]
 
 
-def update_last_seen(
-    df: pd.DataFrame,
-    prev_last_seen_ts: pd.Timestamp | None,
-) -> pd.Timestamp | None:
+def update_last_seen(df, prev_last_seen_ts):
     if df.empty:
         return prev_last_seen_ts
     return df["ts_utc"].max()
-
 
 # ==================================================
 # HELPERS
@@ -128,4 +117,4 @@ def update_last_seen(
 
 def daterange(start, end):
     for n in range((end - start).days + 1):
-        yield start + timedelta(n)
+        yield start + timedelta(days=n)
