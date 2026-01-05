@@ -8,12 +8,9 @@ import logging
 
 log = logging.getLogger(__name__)
 
-BRONZE_DIR = Path("warehouse/bronze/raw_prices")
-STATE_FILE = Path("warehouse/bronze/_market_last_seen.txt")
-
-# ---------------------------------------------------------
+# --------------------------------------------------
 # NIFTY 50 Yahoo Finance tickers
-# ---------------------------------------------------------
+# --------------------------------------------------
 NIFTY50 = [
     "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS",
     "LT.NS", "SBIN.NS", "AXISBANK.NS", "HINDUNILVR.NS", "ITC.NS",
@@ -29,21 +26,21 @@ NIFTY50 = [
     "UPL.NS", "LTIM.NS", "SHRIRAMFIN.NS", "M&M.NS"
 ]
 
-# =========================================================
-# CLI EXPECTED FUNCTIONS (SIGNATURES MUST MATCH)
-# =========================================================
+# ==================================================
+# CLI EXPECTED FUNCTIONS (DO NOT CHANGE SIGNATURES)
+# ==================================================
 
 def load_market_csv(mkt_path: str | Path) -> pd.DataFrame:
     """
-    CLI entrypoint.
+    CLI entry point.
     CSV path is ignored; Yahoo Finance is used instead.
     """
     log.info("Loading market CSV: %s", mkt_path)
 
     end = datetime.now(timezone.utc).date()
-    start = get_last_seen() or (end - timedelta(days=730))
+    start = end - timedelta(days=730)
 
-    records = []
+    frames = []
 
     for ticker in NIFTY50:
         try:
@@ -53,7 +50,7 @@ def load_market_csv(mkt_path: str | Path) -> pd.DataFrame:
                 end=str(end + timedelta(days=1)),
                 interval="1d",
                 auto_adjust=False,
-                progress=False
+                progress=False,
             )
 
             if df.empty:
@@ -61,22 +58,28 @@ def load_market_csv(mkt_path: str | Path) -> pd.DataFrame:
                 continue
 
             df = df.reset_index()
-            df.columns = [c.lower() for c in df.columns]
-            df["ticker"] = ticker.replace(".NS", "")
 
-            records.append(df)
+            # 🔧 FIX: flatten tuple columns safely
+            df.columns = [
+                c[0].lower() if isinstance(c, tuple) else c.lower()
+                for c in df.columns
+            ]
+
+            df["ticker"] = ticker.replace(".NS", "")
+            df.rename(columns={"date": "ts"}, inplace=True)
+
+            df["ts_utc"] = pd.to_datetime(df["ts"], utc=True)
+            df["dt"] = df["ts_utc"].dt.date
+
+            frames.append(df)
 
         except Exception as e:
             log.warning("Skipping %s due to error: %s", ticker, e)
 
-    if not records:
+    if not frames:
         return pd.DataFrame()
 
-    out = pd.concat(records, ignore_index=True)
-
-    out = out.rename(columns={"date": "ts"})
-    out["ts_utc"] = pd.to_datetime(out["ts"], utc=True)
-    out["dt"] = out["ts_utc"].dt.date
+    out = pd.concat(frames, ignore_index=True)
 
     return out[[
         "ticker",
@@ -87,17 +90,16 @@ def load_market_csv(mkt_path: str | Path) -> pd.DataFrame:
         "close",
         "volume",
         "ts_utc",
-        "dt"
+        "dt",
     ]]
 
 
 def filter_incremental(
     df: pd.DataFrame,
-    last_seen_ts: pd.Timestamp | None
+    last_seen_ts: pd.Timestamp | None,
 ) -> pd.DataFrame:
     """
-    CLI passes last_seen_ts.
-    Filter rows strictly newer than last ingest.
+    Keep only rows newer than last ingested timestamp.
     """
     if df.empty or last_seen_ts is None:
         return df
@@ -105,23 +107,14 @@ def filter_incremental(
     return df[df["ts_utc"] > last_seen_ts]
 
 
-def update_last_seen(df: pd.DataFrame) -> None:
+def update_last_seen(
+    df: pd.DataFrame,
+    prev_last_seen_ts: pd.Timestamp | None,
+) -> pd.Timestamp | None:
     """
-    Persist max ts_utc for next incremental run.
+    CLI expects a RETURN value.
     """
     if df.empty:
-        return
+        return prev_last_seen_ts
 
-    last_ts = df["ts_utc"].max()
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(last_ts.isoformat())
-
-
-# =========================================================
-# HELPERS
-# =========================================================
-
-def get_last_seen():
-    if not STATE_FILE.exists():
-        return None
-    return pd.to_datetime(STATE_FILE.read_text(), utc=True)
+    return df["ts_utc"].max()
