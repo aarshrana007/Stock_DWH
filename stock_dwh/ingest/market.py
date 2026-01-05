@@ -4,11 +4,16 @@ import pandas as pd
 import yfinance as yf
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+import logging
+
+log = logging.getLogger(__name__)
 
 BRONZE_DIR = Path("warehouse/bronze/raw_prices")
 STATE_FILE = Path("warehouse/bronze/_market_last_seen.txt")
 
-# NIFTY 50 Yahoo tickers
+# ---------------------------------------------------------
+# NIFTY 50 Yahoo Finance tickers
+# ---------------------------------------------------------
 NIFTY50 = [
     "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS",
     "LT.NS", "SBIN.NS", "AXISBANK.NS", "HINDUNILVR.NS", "ITC.NS",
@@ -24,15 +29,17 @@ NIFTY50 = [
     "UPL.NS", "LTIM.NS", "SHRIRAMFIN.NS", "M&M.NS"
 ]
 
-# -------------------------------------------------------------------
-# CLI EXPECTED FUNCTIONS (DO NOT REMOVE)
-# -------------------------------------------------------------------
+# =========================================================
+# CLI-EXPECTED FUNCTIONS (SIGNATURES MUST MATCH)
+# =========================================================
 
-def load_market_csv() -> pd.DataFrame:
+def load_market_csv(mkt_path: str | Path) -> pd.DataFrame:
     """
-    CLI entrypoint.
-    Replaced CSV logic with Yahoo Finance fetch.
+    CLI calls this with a CSV path.
+    We IGNORE the CSV and fetch live NIFTY 50 data instead.
     """
+    log.info("Loading market CSV: %s", mkt_path)
+
     end = datetime.now(timezone.utc).date()
     start = get_last_seen() or (end - timedelta(days=730))
 
@@ -42,11 +49,15 @@ def load_market_csv() -> pd.DataFrame:
         end=str(end + timedelta(days=1)),
         interval="1d",
         group_by="ticker",
-        threads=True,
-        auto_adjust=False
+        auto_adjust=False,
+        threads=True
     )
 
     records = []
+
+    if df.empty:
+        return pd.DataFrame()
+
     for ticker in NIFTY50:
         if ticker not in df.columns.levels[0]:
             continue
@@ -79,45 +90,28 @@ def load_market_csv() -> pd.DataFrame:
 
 
 def filter_incremental(df: pd.DataFrame) -> pd.DataFrame:
-    """No-op incremental filter (Yahoo already date bounded)"""
+    """
+    CLI expects this.
+    Yahoo fetch already respects date range → no-op.
+    """
     return df
 
 
 def update_last_seen(df: pd.DataFrame) -> None:
-    """Persist max ingested date"""
+    """
+    Persist max ingested date for incremental runs.
+    """
     if df.empty:
         return
+
     last_dt = df["dt"].max()
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(str(last_dt))
 
 
-# -------------------------------------------------------------------
-# MAIN INGEST LOGIC (called by CLI)
-# -------------------------------------------------------------------
-
-def run():
-    df = load_market_csv()
-    df = filter_incremental(df)
-
-    if df.empty:
-        print("⚠️ No new market data")
-        return
-
-    for dt, part in df.groupby("dt"):
-        out = BRONZE_DIR / f"dt={dt}"
-        out.mkdir(parents=True, exist_ok=True)
-        part.to_parquet(out / "part.parquet", index=False)
-
-    update_last_seen(df)
-
-    print(
-        f"✅ Ingested {df['ticker'].nunique()} stocks "
-        f"for {df['dt'].nunique()} days"
-    )
-
-
-# -------------------------------------------------------------------
+# =========================================================
+# HELPER
+# =========================================================
 
 def get_last_seen():
     if not STATE_FILE.exists():
