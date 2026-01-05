@@ -48,7 +48,6 @@ def load_market_csv(mkt_path: str | Path) -> pd.DataFrame:
     frames = []
 
     for day in daterange(start, end):
-        # skip weekends
         if day.weekday() >= 5:
             continue
 
@@ -62,22 +61,28 @@ def load_market_csv(mkt_path: str | Path) -> pd.DataFrame:
             with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
                 df = pd.read_csv(zf.open(zf.namelist()[0]))
 
-            # Normalize columns
             df.columns = [c.upper() for c in df.columns]
 
-            # ✅ Correct filtering (NO SERIES)
-            df = df[df["SYMBOL"].isin(NIFTY50)]
+            # 🔑 Handle NSE schema variants
+            symbol_col = "SYMBOL" if "SYMBOL" in df.columns else "SECURITY"
+            open_col   = "OPEN" if "OPEN" in df.columns else "OPEN_PRICE"
+            high_col   = "HIGH" if "HIGH" in df.columns else "HIGH_PRICE"
+            low_col    = "LOW" if "LOW" in df.columns else "LOW_PRICE"
+            close_col  = "CLOSE" if "CLOSE" in df.columns else "CLOSE_PRICE"
+            vol_col    = "TOTTRDQTY" if "TOTTRDQTY" in df.columns else "NET_TRDQTY"
+
+            df = df[df[symbol_col].isin(NIFTY50)]
 
             if df.empty:
                 continue
 
             df = df.rename(columns={
-                "SYMBOL": "ticker",
-                "OPEN": "open",
-                "HIGH": "high",
-                "LOW": "low",
-                "CLOSE": "close",
-                "TOTTRDQTY": "volume",
+                symbol_col: "ticker",
+                open_col: "open",
+                high_col: "high",
+                low_col: "low",
+                close_col: "close",
+                vol_col: "volume",
             })
 
             df["ts"] = pd.to_datetime(day)
