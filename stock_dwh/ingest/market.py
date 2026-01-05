@@ -25,10 +25,8 @@ NIFTY50 = {
     "SHRIRAMFIN","M&M"
 }
 
-NSE_URL = (
-    "https://archives.nseindia.com/content/cm/"
-    "BhavCopy_NSE_CM_0_0_0_{date}_F_0000.csv.zip"
-)
+# ✅ CORRECT NSE Equity Bhavcopy URL
+NSE_URL = "https://archives.nseindia.com/content/historical/EQUITIES/{year}/{mon}/cm{dd}{mon}{year}bhav.csv.zip"
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
@@ -52,9 +50,14 @@ def load_market_csv(mkt_path: str | Path) -> pd.DataFrame:
             continue
 
         try:
-            url = NSE_URL.format(date=day.strftime("%Y%m%d"))
-            resp = session.get(url, timeout=10)
+            mon = day.strftime("%b").upper()
+            url = NSE_URL.format(
+                year=day.year,
+                mon=mon,
+                dd=day.strftime("%d"),
+            )
 
+            resp = session.get(url, timeout=10)
             if resp.status_code != 200:
                 continue
 
@@ -63,26 +66,22 @@ def load_market_csv(mkt_path: str | Path) -> pd.DataFrame:
 
             df.columns = [c.upper() for c in df.columns]
 
-            # 🔑 Handle NSE schema variants
-            symbol_col = "SYMBOL" if "SYMBOL" in df.columns else "SECURITY"
-            open_col   = "OPEN" if "OPEN" in df.columns else "OPEN_PRICE"
-            high_col   = "HIGH" if "HIGH" in df.columns else "HIGH_PRICE"
-            low_col    = "LOW" if "LOW" in df.columns else "LOW_PRICE"
-            close_col  = "CLOSE" if "CLOSE" in df.columns else "CLOSE_PRICE"
-            vol_col    = "TOTTRDQTY" if "TOTTRDQTY" in df.columns else "NET_TRDQTY"
-
-            df = df[df[symbol_col].isin(NIFTY50)]
+            # ✅ Equity + NIFTY 50 filter
+            df = df[
+                (df["SERIES"] == "EQ") &
+                (df["SYMBOL"].isin(NIFTY50))
+            ]
 
             if df.empty:
                 continue
 
             df = df.rename(columns={
-                symbol_col: "ticker",
-                open_col: "open",
-                high_col: "high",
-                low_col: "low",
-                close_col: "close",
-                vol_col: "volume",
+                "SYMBOL": "ticker",
+                "OPEN": "open",
+                "HIGH": "high",
+                "LOW": "low",
+                "CLOSE": "close",
+                "TOTTRDQTY": "volume",
             })
 
             df["ts"] = pd.to_datetime(day)
