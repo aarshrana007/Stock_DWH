@@ -39,9 +39,8 @@ HEADERS = {"User-Agent": "Mozilla/5.0"}
 def load_market_csv(mkt_path: str | Path) -> pd.DataFrame:
     log.info("Loading market CSV: %s", mkt_path)
 
-    # 🔑 Incremental: only last 7 days (safe for holidays)
     end = datetime.today().date()
-    start = end - timedelta(days=7)
+    start = end - timedelta(days=7)  # incremental window
 
     session = requests.Session()
     session.headers.update(HEADERS)
@@ -49,7 +48,7 @@ def load_market_csv(mkt_path: str | Path) -> pd.DataFrame:
     frames = []
 
     for day in daterange(start, end):
-        # Skip weekends
+        # skip weekends
         if day.weekday() >= 5:
             continue
 
@@ -63,13 +62,11 @@ def load_market_csv(mkt_path: str | Path) -> pd.DataFrame:
             with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
                 df = pd.read_csv(zf.open(zf.namelist()[0]))
 
-            # ✅ NSE uses UPPERCASE
+            # Normalize columns
             df.columns = [c.upper() for c in df.columns]
 
-            df = df[
-                (df["SERIES"] == "EQ") &
-                (df["SYMBOL"].isin(NIFTY50))
-            ]
+            # ✅ Correct filtering (NO SERIES)
+            df = df[df["SYMBOL"].isin(NIFTY50)]
 
             if df.empty:
                 continue
@@ -80,7 +77,7 @@ def load_market_csv(mkt_path: str | Path) -> pd.DataFrame:
                 "HIGH": "high",
                 "LOW": "low",
                 "CLOSE": "close",
-                "TTL_TRD_QNTY": "volume",
+                "TOTTRDQTY": "volume",
             })
 
             df["ts"] = pd.to_datetime(day)
