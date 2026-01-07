@@ -1,234 +1,139 @@
+"""
+Central configuration for stock_dwh.
+Supports local filesystem and S3 warehouse.
+"""
+
 from __future__ import annotations
-
-import argparse
-import pandas as pd
-
-from .config import get_paths, get_sources, get_run_config
-from .meta import Watermarks
-from .utils.logging import get_logger
-from .utils.io import write_parquet, read_parquet, write_json
-
-from .ingest.news import (
-    load_news_csv,
-    load_rss,
-    normalize_news,
-    filter_incremental as news_filter,
-    update_last_seen as news_last,
-)
-from .ingest.market import (
-    load_market_csv,
-    filter_incremental as mkt_filter,
-    update_last_seen as mkt_last,
-)
-
-from .transform.silver import silver_fact_news, silver_fact_prices
-from .features.sentiment import finbert_placeholder
-from .features.build import build_features
-from .model.train import train_placeholder
-from .model.infer import load_model, predict
+from dataclasses import dataclass
+from pathlib import Path
+import os
 
 
 # -------------------------------------------------------------------
-# WAREHOUSE PATH JOIN (LOCAL + S3 SAFE)
+# ENV HELPER
 # -------------------------------------------------------------------
-def wh_join(base, *parts):
-    if isinstance(base, str):
-        return "/".join([base, *parts])
-    return base.joinpath(*parts)
-
-
-# -------------------------------------------------------------------
-# WRITE PARTITIONED DATA (S3 SAFE)
-# -------------------------------------------------------------------
-def _write_partitioned(
-    df: pd.DataFrame,
-    root,
-    partition_col: str = "dt",
-    filename: str = "part.parquet",
-) -> None:
-    if df.empty:
-        return
-
-    if partition_col not in df.columns:
-        write_parquet(df, wh_join(root, filename))
-        return
-
-    for dt, chunk in df.groupby(partition_col):
-        out = wh_join(root, f"{partition_col}={dt}", filename)
-        write_parquet(chunk.reset_index(drop=True), out)
+def _env(name: str, default: str) -> str:
+    v = os.getenv(name)
+    return v if v not in (None, "") else default
 
 
 # -------------------------------------------------------------------
-# INGEST
+# BACKEND SWITCH
 # -------------------------------------------------------------------
-def ingest() -> None:
-    paths = get_paths()
-    src = get_sources()
-    rc = get_run_config()
+DWH_BACKEND = _env("DWH_BACKEND", "local").lower()
 
-    log = get_logger("stock_dwh.ingest", wh_join(paths.logs, "ingest.log"))
+S3_BUCKET = _env("S3_BUCKET", "stock-dwh-nse-ai")
+S3_WAREHOUSE = f"s3://{S3_BUCKET}"
 
-    wm_path = wh_join(paths.repo_root, rc.watermark_path)
-    wm = Watermarks.load(wm_path)
 
-    # ---------------- NEWS ----------------
-    news_frames = []
+# -------------------------------------------------------------------
+# PATHS
+# -------------------------------------------------------------------
+@dataclass(frozen=True)
+class Paths:
+    repo_root: Path
+    warehouse: str | Path
+    artifacts: Path
+    logs: Path
 
-    csv_path = wh_join(paths.repo_root, src.news_github_csv_path)
-    if read_parquet.exists(csv_path):
-        log.info(f"Loading news CSV: {csv_path}")
-        news_frames.append(load_news_csv(csv_path))
+    @property
+    def bronze(self):
+        return self._join("bronze")
 
-    if src.news_rss_urls:
-        log.info(f"Loading RSS: {len(src.news_rss_urls)} urls")
-        news_frames.append(load_rss(src.news_rss_urls))
+    @property
+    def silver(self):
+        return self._join("silver")
 
-    raw_news = (
-        pd.concat(news_frames, ignore_index=True)
-        if news_frames
-        else pd.DataFrame(columns=["title", "link", "published", "summary", "source"])
-    )
+    @property
+    def gold(self):
+        return self._join("gold")
 
-    raw_news = normalize_news(raw_news)
-    raw_news = news_filter(raw_news, wm.news_last_seen_ts)
+    def _join(self, *parts):
+        if isinstance(self.warehouse, str):
+            return "/".join([self.warehouse, *parts])
+        return self.warehouse.joinpath(*parts)
 
-    _write_partitioned(raw_news, wh_join(paths.bronze, "raw_news"))
-    wm.news_last_seen_ts = news_last(raw_news, wm.news_last_seen_ts)
 
-    # ---------------- MARKET ----------------
-    mkt_path = wh_join(paths.repo_root, src.market_csv_path)
-    raw_px = pd.DataFrame()
+def get_paths(repo_root: str | Path | None = None) -> Paths:
+    root = Path(repo_root) if repo_root else Path(
+        _env("STOCK_DWH_ROOT", ".")
+    ).resolve()
 
-    if read_parquet.exists(mkt_path):
-        log.info(f"Loading market CSV: {mkt_path}")
-        raw_px = load_market_csv(mkt_path)
-        raw_px = mkt_filter(raw_px, wm.market_last_seen_ts)
-
-        _write_partitioned(raw_px, wh_join(paths.bronze, "raw_prices"))
-        wm.market_last_seen_ts = mkt_last(raw_px, wm.market_last_seen_ts)
+    if DWH_BACKEND == "s3":
+        warehouse = S3_WAREHOUSE
     else:
-        log.warning(f"Market CSV not found at {mkt_path}")
+        warehouse = Path(
+            _env("STOCK_DWH_WAREHOUSE", str(root / "warehouse"))
+        ).resolve()
+        warehouse.mkdir(parents=True, exist_ok=True)
 
-    wm.save(wm_path)
-    log.info("Ingest done.")
+    artifacts = Path(
+        _env("STOCK_DWH_ARTIFACTS", str(root / "artifacts"))
+    ).resolve()
+    logs = Path(
+        _env("STOCK_DWH_LOGS", str(root / "logs"))
+    ).resolve()
 
+    for p in (artifacts, logs):
+        p.mkdir(parents=True, exist_ok=True)
 
-# -------------------------------------------------------------------
-# SILVER
-# -------------------------------------------------------------------
-def build_silver() -> None:
-    paths = get_paths()
-    log = get_logger("stock_dwh.silver", wh_join(paths.logs, "silver.log"))
-
-    raw_news = read_parquet(wh_join(paths.bronze, "raw_news"))
-    raw_px = read_parquet(wh_join(paths.bronze, "raw_prices"))
-
-    fact_news = silver_fact_news(raw_news) if not raw_news.empty else pd.DataFrame()
-    fact_px = silver_fact_prices(raw_px) if not raw_px.empty else pd.DataFrame()
-
-    _write_partitioned(fact_news, wh_join(paths.silver, "fact_news"))
-    _write_partitioned(fact_px, wh_join(paths.silver, "fact_prices"))
-
-    log.info("Silver build done.")
-
-
-# -------------------------------------------------------------------
-# INFER
-# -------------------------------------------------------------------
-def infer_run() -> None:
-    paths = get_paths()
-    log = get_logger("stock_dwh.infer", wh_join(paths.logs, "infer.log"))
-
-    fact_news = read_parquet(wh_join(paths.silver, "fact_news"))
-    fact_px = read_parquet(wh_join(paths.silver, "fact_prices"))
-
-    if fact_px.empty:
-        log.warning("No prices found. Cannot infer.")
-        return
-
-    scored = finbert_placeholder(fact_news) if not fact_news.empty else pd.DataFrame()
-
-    fact_px["ts_utc"] = pd.to_datetime(fact_px["ts_utc"], utc=True)
-    asof = fact_px["ts_utc"].max()
-
-    feats = build_features(fact_px, scored, asof)
-
-    model_path = wh_join(paths.artifacts, "models/champion/model.pkl")
-
-    if not read_parquet.exists(model_path):
-        tmp = feats.copy()
-        tmp["target"] = tmp["ret_1d"]
-        meta = train_placeholder(tmp[["ticker", "target"]], "target", model_path)
-        write_json(meta, model_path.replace(".pkl", ".json"))
-        log.info("Trained baseline model (placeholder).")
-
-    model = load_model(model_path)
-    preds = predict(model, feats)
-    preds["dt"] = preds["asof_ts"].dt.date.astype(str)
-
-    _write_partitioned(preds, wh_join(paths.gold, "fact_predictions"))
-
-    m = preds.sort_values("pred", ascending=False)
-    mart = pd.concat(
-        [m.head(10).assign(bucket="TOP"), m.tail(10).assign(bucket="BOTTOM")],
-        ignore_index=True,
+    return Paths(
+        repo_root=root,
+        warehouse=warehouse,
+        artifacts=artifacts,
+        logs=logs,
     )
 
-    _write_partitioned(
-        mart,
-        wh_join(paths.gold, "mart_market_snapshot_topbottom"),
-        filename="snapshot.parquet",
+
+# -------------------------------------------------------------------
+# SOURCES
+# -------------------------------------------------------------------
+@dataclass(frozen=True)
+class Sources:
+    news_github_csv_path: str
+    news_rss_urls: tuple[str, ...]
+    market_source: str
+    market_csv_path: str
+
+
+def get_sources() -> Sources:
+    return Sources(
+        news_github_csv_path=_env(
+            "NEWS_GITHUB_CSV_PATH",
+            "data/news_data/historical_news.csv",
+        ),
+        news_rss_urls=tuple(
+            filter(None, _env("NEWS_RSS_URLS", "").split(","))
+        ),
+        market_source=_env("MARKET_SOURCE", "csv"),
+        market_csv_path=_env(
+            "MARKET_CSV_PATH",
+            "stock_dwh/Data/ohlcv.csv",
+        ),
     )
 
-    log.info("Inference done.")
-
 
 # -------------------------------------------------------------------
-# TRAIN
+# RUNTIME CONFIG
 # -------------------------------------------------------------------
-def train_run() -> None:
-    paths = get_paths()
-    log = get_logger("stock_dwh.train", wh_join(paths.logs, "train.log"))
-
-    fact_px = read_parquet(wh_join(paths.silver, "fact_prices"))
-    if fact_px.empty:
-        log.warning("No prices found. Cannot train.")
-        return
-
-    fact_px["ts_utc"] = pd.to_datetime(fact_px["ts_utc"], utc=True)
-    fact_px = fact_px.sort_values(["ticker", "ts_utc"])
-
-    fact_px["next_close"] = fact_px.groupby("ticker")["close"].shift(-1)
-    fact_px["target"] = (
-        fact_px["next_close"] / fact_px["close"] - 1.0
-    ).fillna(0.0)
-
-    training = fact_px[["ticker", "target"]].dropna()
-
-    model_path = wh_join(paths.artifacts, "models/champion/model.pkl")
-    meta = train_placeholder(training, "target", model_path)
-    write_json(meta, model_path.replace(".pkl", ".json"))
-
-    log.info("Training done.")
+@dataclass(frozen=True)
+class RunConfig:
+    timezone: str = "Asia/Kolkata"
+    tickers_path: str = "data/market/nifty50_tickers.txt"
+    watermark_path: str = "warehouse/_meta/watermarks.json"
+    asof_lag_minutes: int = 5
 
 
-# -------------------------------------------------------------------
-# CLI
-# -------------------------------------------------------------------
-def main():
-    ap = argparse.ArgumentParser(prog="stock_dwh")
-    ap.add_argument("cmd", choices=["ingest", "silver", "infer", "train"])
-    args = ap.parse_args()
-
-    if args.cmd == "ingest":
-        ingest()
-    elif args.cmd == "silver":
-        build_silver()
-    elif args.cmd == "infer":
-        infer_run()
-    elif args.cmd == "train":
-        train_run()
-
-
-if __name__ == "__main__":
-    main()
+def get_run_config() -> RunConfig:
+    return RunConfig(
+        timezone=_env("STOCK_DWH_TZ", "Asia/Kolkata"),
+        tickers_path=_env(
+            "TICKERS_PATH",
+            "data/market/nifty50_tickers.txt",
+        ),
+        watermark_path=_env(
+            "WATERMARK_PATH",
+            "warehouse/_meta/watermarks.json",
+        ),
+        asof_lag_minutes=int(_env("ASOF_LAG_MINUTES", "5")),
+    )
