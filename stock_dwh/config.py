@@ -1,88 +1,139 @@
+"""
+Central configuration for stock_dwh.
+Supports local filesystem and S3 warehouse.
+"""
+
 from __future__ import annotations
-
-import argparse
-import pandas as pd
-
-from .config import get_paths, get_sources
-from .ingest import load_market, load_news
-from .silver import build_silver
-from .infer import run_inference
+from dataclasses import dataclass
+from pathlib import Path
+import os
 
 
-# ------------------------------------------------------------------
-# SAFE PATH JOIN (LOCAL + S3)
-# ------------------------------------------------------------------
-def _join(base, *parts):
-    if isinstance(base, str):
-        return "/".join([base, *parts])
-    return base.joinpath(*parts)
+# -------------------------------------------------------------------
+# ENV HELPER
+# -------------------------------------------------------------------
+def _env(name: str, default: str) -> str:
+    v = os.getenv(name)
+    return v if v not in (None, "") else default
 
 
-# ------------------------------------------------------------------
-# WRITE PARTITIONED DATA
-# ------------------------------------------------------------------
-def _write_partitioned(df: pd.DataFrame, base_path, dt_col="dt"):
-    for dt, g in df.groupby(dt_col):
-        out_path = _join(base_path, f"{dt_col}={dt}", "part.parquet")
-        g.drop(columns=[dt_col]).to_parquet(out_path, index=False)
+# -------------------------------------------------------------------
+# BACKEND SWITCH
+# -------------------------------------------------------------------
+DWH_BACKEND = _env("DWH_BACKEND", "local").lower()
+
+S3_BUCKET = _env("S3_BUCKET", "stock-dwh-nse-ai")
+S3_WAREHOUSE = f"s3://{S3_BUCKET}"
 
 
-# ------------------------------------------------------------------
-# INGEST
-# ------------------------------------------------------------------
-def ingest():
-    paths = get_paths()
-    sources = get_sources()
+# -------------------------------------------------------------------
+# PATHS
+# -------------------------------------------------------------------
+@dataclass(frozen=True)
+class Paths:
+    repo_root: Path
+    warehouse: str | Path
+    artifacts: Path
+    logs: Path
 
-    raw_prices = load_market(sources)
-    raw_news = load_news(sources)
+    @property
+    def bronze(self):
+        return self._join("bronze")
 
-    _write_partitioned(
-        raw_prices,
-        _join(paths.bronze, "raw_prices")
+    @property
+    def silver(self):
+        return self._join("silver")
+
+    @property
+    def gold(self):
+        return self._join("gold")
+
+    def _join(self, *parts):
+        if isinstance(self.warehouse, str):
+            return "/".join([self.warehouse, *parts])
+        return self.warehouse.joinpath(*parts)
+
+
+def get_paths(repo_root: str | Path | None = None) -> Paths:
+    root = Path(repo_root) if repo_root else Path(
+        _env("STOCK_DWH_ROOT", ".")
+    ).resolve()
+
+    if DWH_BACKEND == "s3":
+        warehouse = S3_WAREHOUSE
+    else:
+        warehouse = Path(
+            _env("STOCK_DWH_WAREHOUSE", str(root / "warehouse"))
+        ).resolve()
+        warehouse.mkdir(parents=True, exist_ok=True)
+
+    artifacts = Path(
+        _env("STOCK_DWH_ARTIFACTS", str(root / "artifacts"))
+    ).resolve()
+    logs = Path(
+        _env("STOCK_DWH_LOGS", str(root / "logs"))
+    ).resolve()
+
+    for p in (artifacts, logs):
+        p.mkdir(parents=True, exist_ok=True)
+
+    return Paths(
+        repo_root=root,
+        warehouse=warehouse,
+        artifacts=artifacts,
+        logs=logs,
     )
 
-    _write_partitioned(
-        raw_news,
-        _join(paths.bronze, "raw_news")
+
+# -------------------------------------------------------------------
+# SOURCES
+# -------------------------------------------------------------------
+@dataclass(frozen=True)
+class Sources:
+    news_github_csv_path: str
+    news_rss_urls: tuple[str, ...]
+    market_source: str
+    market_csv_path: str
+
+
+def get_sources() -> Sources:
+    return Sources(
+        news_github_csv_path=_env(
+            "NEWS_GITHUB_CSV_PATH",
+            "data/news_data/historical_news.csv",
+        ),
+        news_rss_urls=tuple(
+            filter(None, _env("NEWS_RSS_URLS", "").split(","))
+        ),
+        market_source=_env("MARKET_SOURCE", "csv"),
+        market_csv_path=_env(
+            "MARKET_CSV_PATH",
+            "stock_dwh/Data/ohlcv.csv",
+        ),
     )
 
 
-# ------------------------------------------------------------------
-# SILVER
-# ------------------------------------------------------------------
-def silver():
-    paths = get_paths()
-    build_silver(paths)
+# -------------------------------------------------------------------
+# RUNTIME CONFIG
+# -------------------------------------------------------------------
+@dataclass(frozen=True)
+class RunConfig:
+    timezone: str = "Asia/Kolkata"
+    tickers_path: str = "data/market/nifty50_tickers.txt"
+    watermark_path: str = "warehouse/_meta/watermarks.json"
+    asof_lag_minutes: int = 5
 
 
-# ------------------------------------------------------------------
-# INFER
-# ------------------------------------------------------------------
-def infer():
-    paths = get_paths()
-    run_inference(paths)
-
-
-# ------------------------------------------------------------------
-# CLI ENTRY
-# ------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "command",
-        choices=["ingest", "silver", "infer"],
-        help="Pipeline step to run",
+def get_run_config() -> RunConfig:
+    return RunConfig(
+        timezone=_env("STOCK_DWH_TZ", "Asia/Kolkata"),
+        tickers_path=_env(
+            "TICKERS_PATH",
+            "data/market/nifty50_tickers.txt",
+        ),
+        watermark_path=_env(
+            "WATERMARK_PATH",
+            "warehouse/_meta/watermarks.json",
+        ),
+        asof_lag_minutes=int(_env("ASOF_LAG_MINUTES", "5")),
     )
-    args = parser.parse_args()
-
-    if args.command == "ingest":
-        ingest()
-    elif args.command == "silver":
-        silver()
-    elif args.command == "infer":
-        infer()
-
-
-if __name__ == "__main__":
-    main()
