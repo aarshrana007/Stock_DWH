@@ -1,6 +1,8 @@
 print("✅ CLI LOADED:", __file__)
 def infer_run() -> None:
     paths = get_paths()
+    print("WAREHOUSE PATH:", paths.warehouse)
+    print("BRONZE PATH:", paths.bronze)
     log = get_logger("stock_dwh.infer", paths.logs / "infer.log")
 
     # ---------------- Load silver data ----------------
