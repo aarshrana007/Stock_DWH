@@ -29,6 +29,7 @@ from .features.sentiment import finbert_placeholder
 from .features.build import build_features
 from .model.train import train_placeholder
 from .model.infer import load_model, predict
+from pathlib import Path
 
 
 # ---------------------------------------------------------------------
@@ -63,7 +64,9 @@ def ingest():
     log = get_logger("stock_dwh.ingest", _join(paths.logs, "ingest.log"))
 
     wm_path = _join(paths.repo_root, rc.watermark_path)
-    Watermarks.ensure_parent(wm_path)
+    # Watermarks.ensure_parent(wm_path)
+    Path(wm_path).parent.mkdir(parents=True, exist_ok=True)
+
     wm = Watermarks.load(wm_path)
 
     # ---------------- NEWS ----------------
