@@ -35,70 +35,66 @@ HEADERS = {"User-Agent": "Mozilla/5.0"}
 # ==================================================
 
 def load_market_csv(mkt_path: str | Path) -> pd.DataFrame:
-    log.info("Loading market CSV: %s", mkt_path)
+    """Load OHLCV market data from a local CSV.
 
-    end = datetime.today().date()
-    start = end - timedelta(days=7)  # incremental window
+    Expected input columns (case-insensitive):
+      - ticker (or symbol)
+      - datetime / ts_utc / timestamp / date
+      - open, high, low, close, volume
 
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    Produces:
+      ticker, ts_utc (UTC), open, high, low, close, volume, dt (YYYY-MM-DD)
+    """
+    p = Path(mkt_path)
+    df = pd.read_csv(p)
 
-    frames = []
+    # normalize column names
+    df.columns = [c.strip().lower() for c in df.columns]
 
-    for day in daterange(start, end):
-        if day.weekday() >= 5:
-            continue
+    # ticker
+    if "ticker" not in df.columns:
+        if "symbol" in df.columns:
+            df = df.rename(columns={"symbol": "ticker"})
+        else:
+            raise ValueError(f"Market CSV missing ticker/symbol column: {p}")
 
-        try:
-            mon = day.strftime("%b").upper()
-            url = NSE_URL.format(
-                year=day.year,
-                mon=mon,
-                dd=day.strftime("%d"),
-            )
+    df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
 
-            resp = session.get(url, timeout=10)
-            if resp.status_code != 200:
-                continue
+    # find time column
+    time_col = None
+    for cand in ("ts_utc", "datetime", "timestamp", "date", "time"):
+        if cand in df.columns:
+            time_col = cand
+            break
 
-            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-                df = pd.read_csv(zf.open(zf.namelist()[0]))
+    if time_col is None:
+        # Try common variants
+        for cand in ("date_time", "datetimestamp", "trade_date"):
+            if cand in df.columns:
+                time_col = cand
+                break
 
-            df.columns = [c.upper() for c in df.columns]
+    if time_col is None:
+        # Don't crash the pipeline; return empty and let caller log a warning
+        log.warning("Market CSV has no datetime column. Columns=%s", df.columns.tolist())
+        return pd.DataFrame(columns=["ticker","ts_utc","open","high","low","close","volume","dt"])
 
-            # ✅ Equity + NIFTY 50 filter
-            df = df[
-                (df["SERIES"] == "EQ") &
-                (df["SYMBOL"].isin(NIFTY50))
-            ]
+    # parse to UTC
+    ts = pd.to_datetime(df[time_col], errors="coerce", utc=True)
+    df = df.assign(ts_utc=ts)
+    df = df.dropna(subset=["ts_utc"])
 
-            if df.empty:
-                continue
+    # numeric columns
+    for c in ("open","high","low","close","volume"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        else:
+            df[c] = pd.NA
 
-            df = df.rename(columns={
-                "SYMBOL": "ticker",
-                "OPEN": "open",
-                "HIGH": "high",
-                "LOW": "low",
-                "CLOSE": "close",
-                "TOTTRDQTY": "volume",
-            })
+    df["dt"] = df["ts_utc"].dt.date.astype(str)
 
-            df["ts"] = pd.to_datetime(day)
-            df["ts_utc"] = pd.to_datetime(df["ts"], utc=True)
-            df["dt"] = df["ts_utc"].dt.date
-
-            frames.append(df[[
-                "ticker","ts","open","high","low","close","volume","ts_utc","dt"
-            ]])
-
-        except Exception as e:
-            log.warning("Bhavcopy failed for %s: %s", day, e)
-
-    if not frames:
-        return pd.DataFrame()
-
-    return pd.concat(frames, ignore_index=True)
+    out = df[["ticker","ts_utc","open","high","low","close","volume","dt"]].copy()
+    return out
 
 
 def filter_incremental(df, last_seen_ts):
