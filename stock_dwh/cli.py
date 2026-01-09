@@ -1,3 +1,4 @@
+print("✅ CLI LOADED:", __file__)
 def infer_run() -> None:
     paths = get_paths()
     log = get_logger("stock_dwh.infer", paths.logs / "infer.log")
