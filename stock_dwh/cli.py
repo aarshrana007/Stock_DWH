@@ -1,3 +1,6 @@
+import sys
+print("ARGV:", sys.argv)
+
 print("✅ CLI LOADED:", __file__)
 def infer_run() -> None:
     paths = get_paths()
