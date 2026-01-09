@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import s3fs
-import os
 
 
+# ---------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------
 def _is_s3(path: str | Path) -> bool:
     return str(path).startswith("s3://")
 
@@ -23,14 +27,14 @@ def _get_fs():
     )
 
 
-# ------------------------------------------------------------------
-# WRITE PARQUET (NO DICTIONARY ENCODING)
-# ------------------------------------------------------------------
+# ---------------------------------------------------------
+# PARQUET WRITE (schema-safe)
+# ---------------------------------------------------------
 def write_parquet(df: pd.DataFrame, path: str | Path) -> None:
     if df.empty:
         return
 
-    # 🔒 FORCE dt to plain string
+    # 🔒 normalize dt to plain string
     if "dt" in df.columns:
         df["dt"] = df["dt"].astype(str)
 
@@ -43,7 +47,7 @@ def write_parquet(df: pd.DataFrame, path: str | Path) -> None:
                 table,
                 f,
                 compression="snappy",
-                use_dictionary=False,   # 🔥 CRITICAL FIX
+                use_dictionary=False,   # 🔥 critical
             )
     else:
         path = Path(path)
@@ -52,13 +56,13 @@ def write_parquet(df: pd.DataFrame, path: str | Path) -> None:
             table,
             path,
             compression="snappy",
-            use_dictionary=False,     # 🔥 CRITICAL FIX
+            use_dictionary=False,     # 🔥 critical
         )
 
 
-# ------------------------------------------------------------------
-# READ PARQUET (SAFE MERGE)
-# ------------------------------------------------------------------
+# ---------------------------------------------------------
+# PARQUET READ (schema-safe merge)
+# ---------------------------------------------------------
 def read_parquet(path: str | Path) -> pd.DataFrame:
     if _is_s3(path):
         fs = _get_fs()
@@ -77,7 +81,7 @@ def read_parquet(path: str | Path) -> pd.DataFrame:
     for f in files:
         df = pd.read_parquet(f)
 
-        # 🔒 NORMALISE dt TYPE
+        # 🔒 normalize dt again
         if "dt" in df.columns:
             df["dt"] = df["dt"].astype(str)
 
@@ -86,9 +90,9 @@ def read_parquet(path: str | Path) -> pd.DataFrame:
     return pd.concat(dfs, ignore_index=True)
 
 
-# ------------------------------------------------------------------
-# JSON HELPERS
-# ------------------------------------------------------------------
+# ---------------------------------------------------------
+# JSON READ / WRITE (RESTORED)
+# ---------------------------------------------------------
 def write_json(obj: dict, path: str | Path) -> None:
     if _is_s3(path):
         fs = _get_fs()
@@ -99,3 +103,13 @@ def write_json(obj: dict, path: str | Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
             json.dump(obj, f, indent=2)
+
+
+def read_json(path: str | Path) -> dict:
+    if _is_s3(path):
+        fs = _get_fs()
+        with fs.open(path, "r") as f:
+            return json.load(f)
+    else:
+        with open(path, "r") as f:
+            return json.load(f)
