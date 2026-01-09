@@ -4,7 +4,6 @@ import argparse
 import pandas as pd
 from pathlib import Path
 
-# ✅ RELATIVE IMPORTS (THIS FIXES YOUR ERROR)
 from .config import get_paths, get_sources, get_run_config
 from .meta import Watermarks
 from .utils.logging import get_logger
@@ -35,6 +34,7 @@ from .model.infer import load_model, predict
 # Helpers
 # ---------------------------------------------------------------------
 def _join(base, *paths):
+    """Join paths for local FS or S3-style string."""
     if isinstance(base, str):
         return "/".join([base, *paths])
     return base.joinpath(*paths)
@@ -62,8 +62,9 @@ def ingest():
     rc = get_run_config()
     log = get_logger("stock_dwh.ingest", _join(paths.logs, "ingest.log"))
 
-    wm_path = _join(paths.repo_root, rc.watermark_path)
-    Watermarks.ensure_parent(wm_path)
+    # watermark path (local file)
+    wm_path = Path(paths.repo_root) / rc.watermark_path
+    wm_path.parent.mkdir(parents=True, exist_ok=True)
     wm = Watermarks.load(wm_path)
 
     # ---------------- NEWS ----------------
@@ -98,8 +99,14 @@ def ingest():
         log.info(f"Loading market CSV: {mkt_path}")
         raw_px = load_market_csv(mkt_path)
 
-        # ✅ REQUIRED NORMALIZATION (your CSV uses `datetime`)
-        raw_px["ts_utc"] = pd.to_datetime(raw_px["datetime"], utc=True)
+        # ✅ your CSV has `datetime` column; pipeline expects ts_utc + dt
+        if "datetime" in raw_px.columns:
+            raw_px["ts_utc"] = pd.to_datetime(raw_px["datetime"], utc=True)
+        elif "ts_utc" in raw_px.columns:
+            raw_px["ts_utc"] = pd.to_datetime(raw_px["ts_utc"], utc=True)
+        else:
+            raise ValueError("Market DF must contain 'datetime' or 'ts_utc' column")
+
         raw_px["dt"] = raw_px["ts_utc"].dt.date.astype(str)
 
         raw_px = mkt_filter(raw_px, wm.market_last_seen_ts)
@@ -142,15 +149,18 @@ def infer():
     fact_news = read_parquet(_join(paths.silver, "fact_news"))
     fact_px = read_parquet(_join(paths.silver, "fact_prices"))
 
+    # universe file produced by sync (or you can maintain it)
     universe = pd.read_csv("Data/market/nifty50.csv")
-    universe["ticker"] = universe["ticker"].str.upper()
+    universe["ticker"] = universe["ticker"].astype(str).str.upper().str.strip()
 
     if fact_px.empty:
         preds = universe.copy()
         preds["pred"] = None
         preds["signal_status"] = "NO_PRICE"
     else:
-        fact_px["ticker"] = fact_px["ticker"].str.upper()
+        fact_px["ticker"] = fact_px["ticker"].astype(str).str.upper().str.strip()
+
+        # Expand to all 50 tickers
         fact_px = universe.merge(fact_px, on="ticker", how="left")
         fact_px["has_price"] = fact_px["close"].notna()
 
@@ -162,7 +172,10 @@ def infer():
             preds["pred"] = None
             preds["signal_status"] = "NO_PRICE"
         else:
+            # ensure ts_utc is datetime
+            valid_px["ts_utc"] = pd.to_datetime(valid_px["ts_utc"], utc=True)
             asof = valid_px["ts_utc"].max()
+
             feats = build_features(valid_px, scored, asof)
 
             model_path = _join(paths.artifacts, "models/champion/model.pkl")
@@ -170,11 +183,13 @@ def infer():
             preds_valid = predict(model, feats)
 
             preds_valid["signal_status"] = "MODEL"
+
             preds = universe.merge(preds_valid, on="ticker", how="left")
             preds.loc[preds["pred"].isna(), "signal_status"] = "NO_PRICE"
 
     preds["dt"] = pd.Timestamp.utcnow().date().astype(str)
 
+    # Gold outputs
     write_partitioned(preds, _join(paths.gold, "fact_predictions"))
 
     ranked = preds[preds["pred"].notna()].sort_values("pred", ascending=False)
@@ -206,9 +221,7 @@ def train():
         return
 
     fact_px["next_close"] = fact_px.groupby("ticker")["close"].shift(-1)
-    fact_px["target"] = (
-        fact_px["next_close"] / fact_px["close"] - 1.0
-    ).fillna(0.0)
+    fact_px["target"] = (fact_px["next_close"] / fact_px["close"] - 1.0).fillna(0.0)
 
     training = fact_px[["ticker", "target"]].dropna()
 
@@ -220,7 +233,7 @@ def train():
 
 
 # ---------------------------------------------------------------------
-# CLI ENTRYPOINT (CRITICAL)
+# CLI ENTRYPOINT
 # ---------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(prog="stock_dwh")
