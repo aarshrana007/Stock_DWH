@@ -1,115 +1,101 @@
 from __future__ import annotations
 
-from pathlib import Path
 import json
-import os
-from typing import Union, Iterable, List, Optional
-
+from pathlib import Path
 import pandas as pd
-
-try:
-    import s3fs  # type: ignore
-except Exception:  # pragma: no cover
-    s3fs = None
-
-PathLike = Union[str, Path]
+import pyarrow as pa
+import pyarrow.parquet as pq
+import s3fs
+import os
 
 
-def _is_s3(p: PathLike) -> bool:
-    return isinstance(p, str) and p.startswith("s3://")
+def _is_s3(path: str | Path) -> bool:
+    return str(path).startswith("s3://")
 
 
-def _s3_parts(s3_url: str) -> tuple[str, str]:
-    # s3://bucket/key...
-    u = s3_url[5:]
-    bucket, _, key = u.partition("/")
-    return bucket, key
+def _get_fs():
+    return s3fs.S3FileSystem(
+        key=os.environ.get("AWS_ACCESS_KEY_ID"),
+        secret=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        client_kwargs={
+            "region_name": os.environ.get("AWS_DEFAULT_REGION", "ap-south-1")
+        },
+    )
 
 
-def _get_s3fs():
-    if s3fs is None:
-        raise ImportError("s3fs is required for S3 paths. Install: pip install s3fs boto3")
-    # Use env vars if present (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
-    return s3fs.S3FileSystem(anon=False)
-
-
-def ensure_parent(path: PathLike) -> None:
-    if _is_s3(path):
+# ------------------------------------------------------------------
+# WRITE PARQUET (NO DICTIONARY ENCODING)
+# ------------------------------------------------------------------
+def write_parquet(df: pd.DataFrame, path: str | Path) -> None:
+    if df.empty:
         return
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
 
+    # 🔒 FORCE dt to plain string
+    if "dt" in df.columns:
+        df["dt"] = df["dt"].astype(str)
 
-def exists(path: PathLike) -> bool:
+    table = pa.Table.from_pandas(df, preserve_index=False)
+
     if _is_s3(path):
-        fs = _get_s3fs()
-        bucket, key = _s3_parts(str(path))
-        return fs.exists(f"{bucket}/{key}")
-    return Path(path).exists()
-
-
-def list_parquet_files(root: PathLike) -> List[PathLike]:
-    """Return list of parquet files under root (recursive). Works for local and S3."""
-    if _is_s3(root):
-        fs = _get_s3fs()
-        bucket, key = _s3_parts(str(root))
-        prefix = f"{bucket}/{key}".rstrip("/")
-        # include both root file and recursive
-        files = fs.glob(prefix + "/**/*.parquet")
-        return [f"s3://{f}" for f in files]
-    p = Path(root)
-    if p.is_file() and p.suffix == ".parquet":
-        return [p]
-    return list(p.rglob("*.parquet"))
-
-
-def write_parquet(df: pd.DataFrame, path: PathLike) -> None:
-    ensure_parent(path)
-    if _is_s3(path):
-        # pandas + s3fs handles the transport
-        df.to_parquet(str(path), index=False)
+        fs = _get_fs()
+        with fs.open(path, "wb") as f:
+            pq.write_table(
+                table,
+                f,
+                compression="snappy",
+                use_dictionary=False,   # 🔥 CRITICAL FIX
+            )
     else:
-        df.to_parquet(Path(path), index=False)
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(
+            table,
+            path,
+            compression="snappy",
+            use_dictionary=False,     # 🔥 CRITICAL FIX
+        )
 
 
-def read_parquet(path: PathLike) -> pd.DataFrame:
-    """Read a parquet file OR a directory dataset (all parquet under it)."""
+# ------------------------------------------------------------------
+# READ PARQUET (SAFE MERGE)
+# ------------------------------------------------------------------
+def read_parquet(path: str | Path) -> pd.DataFrame:
     if _is_s3(path):
-        # If it's a directory/prefix, load all parquet under it.
-        if str(path).endswith("/") or not str(path).lower().endswith(".parquet"):
-            files = list_parquet_files(path)
-            if not files:
-                return pd.DataFrame()
-            return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
-        return pd.read_parquet(str(path))
-    p = Path(path)
-    if p.is_dir():
-        files = list_parquet_files(p)
-        if not files:
-            return pd.DataFrame()
-        return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
-    return pd.read_parquet(p)
-
-
-def write_json(obj, path: PathLike) -> None:
-    ensure_parent(path)
-    if _is_s3(path):
-        fs = _get_s3fs()
-        bucket, key = _s3_parts(str(path))
-        with fs.open(f"{bucket}/{key}", "w") as f:
-            json.dump(obj, f, indent=2, default=str)
+        fs = _get_fs()
+        files = fs.find(str(path))
     else:
-        with open(Path(path), "w", encoding="utf-8") as f:
-            json.dump(obj, f, indent=2, default=str)
+        path = Path(path)
+        if path.is_file():
+            files = [str(path)]
+        else:
+            files = [str(p) for p in path.rglob("*.parquet")]
+
+    if not files:
+        return pd.DataFrame()
+
+    dfs = []
+    for f in files:
+        df = pd.read_parquet(f)
+
+        # 🔒 NORMALISE dt TYPE
+        if "dt" in df.columns:
+            df["dt"] = df["dt"].astype(str)
+
+        dfs.append(df)
+
+    return pd.concat(dfs, ignore_index=True)
 
 
-def read_json(path: PathLike):
-    if not exists(path):
-        return {}
+# ------------------------------------------------------------------
+# JSON HELPERS
+# ------------------------------------------------------------------
+def write_json(obj: dict, path: str | Path) -> None:
     if _is_s3(path):
-        fs = _get_s3fs()
-        bucket, key = _s3_parts(str(path))
-        with fs.open(f"{bucket}/{key}", "r") as f:
-            return json.load(f)
-    with open(Path(path), "r", encoding="utf-8") as f:
-        return json.load(f)
+        fs = _get_fs()
+        with fs.open(path, "w") as f:
+            json.dump(obj, f, indent=2)
+    else:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(obj, f, indent=2)
