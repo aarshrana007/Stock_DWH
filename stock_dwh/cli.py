@@ -193,7 +193,9 @@ def infer():
             preds = universe.merge(preds_valid, on="ticker", how="left")
             preds.loc[preds["pred"].isna(), "signal_status"] = "NO_PRICE"
 
-    preds["dt"] = pd.Timestamp.utcnow().date().astype(str)
+    # preds["dt"] = pd.Timestamp.utcnow().date().astype(str)
+    preds["dt"] = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+
     write_partitioned(preds, paths.gold / "fact_predictions")
 
     ranked = preds[preds["pred"].notna()].sort_values("pred", ascending=False)
