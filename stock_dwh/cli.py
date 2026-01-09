@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import argparse
-import pandas as pd
+import os
 from pathlib import Path
+import pandas as pd
 
 from .config import get_paths, get_sources, get_run_config
 from .meta import Watermarks
@@ -34,7 +35,6 @@ from .model.infer import load_model, predict
 # Helpers
 # ---------------------------------------------------------------------
 def _join(base, *paths):
-    """Join paths for local FS or S3-style string."""
     if isinstance(base, str):
         return "/".join([base, *paths])
     return base.joinpath(*paths)
@@ -62,9 +62,8 @@ def ingest():
     rc = get_run_config()
     log = get_logger("stock_dwh.ingest", _join(paths.logs, "ingest.log"))
 
-    # watermark path (local file)
-    wm_path = Path(paths.repo_root) / rc.watermark_path
-    wm_path.parent.mkdir(parents=True, exist_ok=True)
+    wm_path = _join(paths.repo_root, rc.watermark_path)
+    Watermarks.ensure_parent(wm_path)
     wm = Watermarks.load(wm_path)
 
     # ---------------- NEWS ----------------
@@ -99,18 +98,12 @@ def ingest():
         log.info(f"Loading market CSV: {mkt_path}")
         raw_px = load_market_csv(mkt_path)
 
-        # ✅ your CSV has `datetime` column; pipeline expects ts_utc + dt
-        if "datetime" in raw_px.columns:
-            raw_px["ts_utc"] = pd.to_datetime(raw_px["datetime"], utc=True)
-        elif "ts_utc" in raw_px.columns:
-            raw_px["ts_utc"] = pd.to_datetime(raw_px["ts_utc"], utc=True)
-        else:
-            raise ValueError("Market DF must contain 'datetime' or 'ts_utc' column")
-
+        raw_px["ts_utc"] = pd.to_datetime(
+            raw_px.get("ts_utc", raw_px.get("datetime")), utc=True
+        )
         raw_px["dt"] = raw_px["ts_utc"].dt.date.astype(str)
 
         raw_px = mkt_filter(raw_px, wm.market_last_seen_ts)
-
         write_partitioned(raw_px, _join(paths.bronze, "raw_prices"))
         wm.market_last_seen_ts = mkt_last(raw_px, wm.market_last_seen_ts)
     else:
@@ -140,27 +133,35 @@ def silver():
 
 
 # ---------------------------------------------------------------------
-# INFER (ALWAYS 50 STOCKS)
+# INFER (ENV-VAR BASED UNIVERSE)
 # ---------------------------------------------------------------------
 def infer():
     paths = get_paths()
     log = get_logger("stock_dwh.infer", _join(paths.logs, "infer.log"))
 
+    # -------- NIFTY-50 PATH (ENV VAR) --------
+    universe_path = Path(
+        os.getenv("NIFTY50_PATH", "stock_dwh/Data/market/nifty50.csv")
+    )
+
+    if not universe_path.exists():
+        raise FileNotFoundError(
+            f"NIFTY50_PATH not found: {universe_path.resolve()}"
+        )
+
+    universe = pd.read_csv(universe_path)
+    universe["ticker"] = universe["ticker"].str.upper()
+
+    # -------- Load silver --------
     fact_news = read_parquet(_join(paths.silver, "fact_news"))
     fact_px = read_parquet(_join(paths.silver, "fact_prices"))
-
-    # universe file produced by sync (or you can maintain it)
-    universe = pd.read_csv("Data/market/nifty50.csv")
-    universe["ticker"] = universe["ticker"].astype(str).str.upper().str.strip()
 
     if fact_px.empty:
         preds = universe.copy()
         preds["pred"] = None
         preds["signal_status"] = "NO_PRICE"
     else:
-        fact_px["ticker"] = fact_px["ticker"].astype(str).str.upper().str.strip()
-
-        # Expand to all 50 tickers
+        fact_px["ticker"] = fact_px["ticker"].str.upper()
         fact_px = universe.merge(fact_px, on="ticker", how="left")
         fact_px["has_price"] = fact_px["close"].notna()
 
@@ -172,10 +173,7 @@ def infer():
             preds["pred"] = None
             preds["signal_status"] = "NO_PRICE"
         else:
-            # ensure ts_utc is datetime
-            valid_px["ts_utc"] = pd.to_datetime(valid_px["ts_utc"], utc=True)
             asof = valid_px["ts_utc"].max()
-
             feats = build_features(valid_px, scored, asof)
 
             model_path = _join(paths.artifacts, "models/champion/model.pkl")
@@ -183,13 +181,10 @@ def infer():
             preds_valid = predict(model, feats)
 
             preds_valid["signal_status"] = "MODEL"
-
             preds = universe.merge(preds_valid, on="ticker", how="left")
             preds.loc[preds["pred"].isna(), "signal_status"] = "NO_PRICE"
 
     preds["dt"] = pd.Timestamp.utcnow().date().astype(str)
-
-    # Gold outputs
     write_partitioned(preds, _join(paths.gold, "fact_predictions"))
 
     ranked = preds[preds["pred"].notna()].sort_values("pred", ascending=False)
@@ -221,10 +216,11 @@ def train():
         return
 
     fact_px["next_close"] = fact_px.groupby("ticker")["close"].shift(-1)
-    fact_px["target"] = (fact_px["next_close"] / fact_px["close"] - 1.0).fillna(0.0)
+    fact_px["target"] = (
+        fact_px["next_close"] / fact_px["close"] - 1.0
+    ).fillna(0.0)
 
     training = fact_px[["ticker", "target"]].dropna()
-
     model_path = _join(paths.artifacts, "models/champion/model.pkl")
     meta = train_placeholder(training, "target", model_path)
     write_json(meta, model_path.replace(".pkl", ".json"))
@@ -233,7 +229,7 @@ def train():
 
 
 # ---------------------------------------------------------------------
-# CLI ENTRYPOINT
+# CLI
 # ---------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(prog="stock_dwh")
