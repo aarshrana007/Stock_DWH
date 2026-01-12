@@ -63,31 +63,72 @@ def write_parquet(df: pd.DataFrame, path: str | Path) -> None:
 # ---------------------------------------------------------
 # PARQUET READ (schema-safe merge)
 # ---------------------------------------------------------
+# def read_parquet(path: str | Path) -> pd.DataFrame:
+#     if _is_s3(path):
+#         fs = _get_fs()
+#         files = fs.find(str(path))
+#     else:
+#         path = Path(path)
+#         if path.is_file():
+#             files = [str(path)]
+#         else:
+#             files = [str(p) for p in path.rglob("*.parquet")]
+
+#     if not files:
+#         return pd.DataFrame()
+
+#     dfs = []
+#     for f in files:
+#         df = pd.read_parquet(f)
+
+#         # 🔒 normalize dt again
+#         if "dt" in df.columns:
+#             df["dt"] = df["dt"].astype(str)
+
+#         dfs.append(df)
+
+#     return pd.concat(dfs, ignore_index=True)
+
 def read_parquet(path: str | Path) -> pd.DataFrame:
     if _is_s3(path):
         fs = _get_fs()
         files = fs.find(str(path))
+        if not files:
+            return pd.DataFrame()
+
+        dfs = []
+        for f in files:
+            df = pd.read_parquet(f, filesystem=fs)
+
+            # normalize dt again
+            if "dt" in df.columns:
+                df["dt"] = df["dt"].astype(str)
+
+            dfs.append(df)
+
+        return pd.concat(dfs, ignore_index=True)
+
     else:
         path = Path(path)
         if path.is_file():
-            files = [str(path)]
+            files = [path]
         else:
-            files = [str(p) for p in path.rglob("*.parquet")]
+            files = list(path.rglob("*.parquet"))
 
-    if not files:
-        return pd.DataFrame()
+        if not files:
+            return pd.DataFrame()
 
-    dfs = []
-    for f in files:
-        df = pd.read_parquet(f)
+        dfs = []
+        for f in files:
+            df = pd.read_parquet(f)
 
-        # 🔒 normalize dt again
-        if "dt" in df.columns:
-            df["dt"] = df["dt"].astype(str)
+            if "dt" in df.columns:
+                df["dt"] = df["dt"].astype(str)
 
-        dfs.append(df)
+            dfs.append(df)
 
-    return pd.concat(dfs, ignore_index=True)
+        return pd.concat(dfs, ignore_index=True)
+
 
 
 # ---------------------------------------------------------
