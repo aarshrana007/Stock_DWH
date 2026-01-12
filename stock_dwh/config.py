@@ -1,58 +1,60 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
 from pathlib import Path
 import os
 
 
-# --------------------------------------------------
-# Helpers
-# --------------------------------------------------
 def _env(name: str, default: str) -> str:
     v = os.getenv(name)
     return v if v not in (None, "") else default
 
 
-# --------------------------------------------------
-# PATH CONFIG
-# --------------------------------------------------
 @dataclass(frozen=True)
 class Paths:
     repo_root: Path
-    warehouse: Path
-    artifacts: Path
+    warehouse: str | Path
+    artifacts: str | Path
     logs: Path
 
     @property
-    def bronze(self) -> Path:
-        return self.warehouse / "bronze"
+    def bronze(self):
+        return f"{self.warehouse}/bronze"
 
     @property
-    def silver(self) -> Path:
-        return self.warehouse / "silver"
+    def silver(self):
+        return f"{self.warehouse}/silver"
 
     @property
-    def gold(self) -> Path:
-        return self.warehouse / "gold"
+    def gold(self):
+        return f"{self.warehouse}/gold"
 
 
 def get_paths(repo_root: str | Path | None = None) -> Paths:
-    root = Path(repo_root) if repo_root else Path(_env("STOCK_DWH_ROOT", ".")).resolve()
+    root = (
+        Path(repo_root)
+        if repo_root
+        else Path(_env("STOCK_DWH_ROOT", ".")).resolve()
+    )
 
-    warehouse = Path(
-        _env("STOCK_DWH_WAREHOUSE", str(root / "warehouse"))
-    ).resolve()
+    warehouse_env = _env("STOCK_DWH_WAREHOUSE", str(root / "warehouse"))
+    artifacts_env = _env("STOCK_DWH_ARTIFACTS", str(root / "artifacts"))
+    logs_env = _env("STOCK_DWH_LOGS", str(root / "logs"))
 
-    artifacts = Path(
-        _env("STOCK_DWH_ARTIFACTS", str(root / "artifacts"))
-    ).resolve()
+    # 🚨 CRITICAL: S3 paths MUST remain strings
+    warehouse = (
+        warehouse_env
+        if warehouse_env.startswith("s3://")
+        else Path(warehouse_env).resolve()
+    )
 
-    logs = Path(
-        _env("STOCK_DWH_LOGS", str(root / "logs"))
-    ).resolve()
+    artifacts = (
+        artifacts_env
+        if artifacts_env.startswith("s3://")
+        else Path(artifacts_env).resolve()
+    )
 
-    for p in (warehouse, artifacts, logs):
-        p.mkdir(parents=True, exist_ok=True)
+    logs = Path(logs_env).resolve()
+    logs.mkdir(parents=True, exist_ok=True)
 
     return Paths(
         repo_root=root,
@@ -62,54 +64,55 @@ def get_paths(repo_root: str | Path | None = None) -> Paths:
     )
 
 
-# --------------------------------------------------
-# SOURCE CONFIG
-# --------------------------------------------------
+# -------------------------------------------------
+# Sources
+# -------------------------------------------------
 @dataclass(frozen=True)
 class Sources:
-    # News
-    news_github_csv_path: Path
+    news_github_csv_path: str
     news_rss_urls: tuple[str, ...]
-
-    # Market
     market_source: str
-    market_csv_path: Path
+    market_csv_path: str
 
 
 def get_sources() -> Sources:
     return Sources(
-        news_github_csv_path=Path(
-            _env("NEWS_GITHUB_CSV_PATH", "data/news_data/historical_news.csv")
+        news_github_csv_path=_env(
+            "NEWS_GITHUB_CSV_PATH",
+            "stock_dwh/Data/news/historical_news.csv",
         ),
         news_rss_urls=tuple(
-            u for u in _env("NEWS_RSS_URLS", "").split(",") if u
+            filter(None, _env("NEWS_RSS_URLS", "").split(","))
         ),
         market_source=_env("MARKET_SOURCE", "csv"),
-        market_csv_path=Path(
-            _env("MARKET_CSV_PATH", "stock_dwh/Data/ohlcv.csv")
+        market_csv_path=_env(
+            "MARKET_CSV_PATH",
+            "stock_dwh/Data/ohlcv.csv",
         ),
     )
 
 
-# --------------------------------------------------
-# RUNTIME CONFIG
-# --------------------------------------------------
+# -------------------------------------------------
+# Run config
+# -------------------------------------------------
 @dataclass(frozen=True)
 class RunConfig:
     timezone: str
-    tickers_path: Path
-    watermark_path: Path
+    tickers_path: str
+    watermark_path: str
     asof_lag_minutes: int
 
 
 def get_run_config() -> RunConfig:
     return RunConfig(
         timezone=_env("STOCK_DWH_TZ", "Asia/Kolkata"),
-        tickers_path=Path(
-            _env("TICKERS_PATH", "stock_dwh/Data/market/nifty50.csv")
+        tickers_path=_env(
+            "TICKERS_PATH",
+            "stock_dwh/Data/market/nifty50.csv",
         ),
-        watermark_path=Path(
-            _env("WATERMARK_PATH", "warehouse/_meta/watermarks.json")
+        watermark_path=_env(
+            "WATERMARK_PATH",
+            "_meta/watermarks.json",
         ),
         asof_lag_minutes=int(_env("ASOF_LAG_MINUTES", "5")),
     )
