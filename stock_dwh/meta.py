@@ -2,7 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import pandas as pd
 from .utils.io import read_json, write_json
+
+
+def _to_iso(ts):
+    """Convert timestamps safely to ISO string for JSON."""
+    if ts is None:
+        return None
+    if isinstance(ts, pd.Timestamp):
+        return ts.isoformat()
+    return str(ts)
 
 
 @dataclass
@@ -14,7 +24,7 @@ class Watermarks:
     def load(path: Path) -> "Watermarks":
         path = Path(path)
 
-        # ✅ FIRST RUN SAFE-GUARD
+        # First run: no watermark file
         if not path.exists():
             return Watermarks()
 
@@ -30,8 +40,8 @@ class Watermarks:
 
         write_json(
             {
-                "news_last_seen_ts": self.news_last_seen_ts,
-                "market_last_seen_ts": self.market_last_seen_ts,
+                "news_last_seen_ts": _to_iso(self.news_last_seen_ts),
+                "market_last_seen_ts": _to_iso(self.market_last_seen_ts),
             },
             path,
         )
