@@ -32,9 +32,16 @@ from .features.build import build_features
 # -------------------------------------------------------------------
 # Helpers
 # -------------------------------------------------------------------
+def join(base, *parts):
+    """Join paths safely for local Path or s3:// string."""
+    if isinstance(base, str):
+        return "/".join([base.rstrip("/")] + [p.strip("/") for p in parts])
+    return base.joinpath(*parts)
+
+
 def write_partitioned(
     df: pd.DataFrame,
-    root: Path,
+    root,
     partition_col: str = "dt",
     filename: str = "part.parquet",
 ):
@@ -42,11 +49,11 @@ def write_partitioned(
         return
 
     if partition_col not in df.columns:
-        write_parquet(df, root / filename)
+        write_parquet(df, join(root, filename))
         return
 
     for v, chunk in df.groupby(partition_col):
-        out = root / f"{partition_col}={v}" / filename
+        out = join(root, f"{partition_col}={v}", filename)
         write_parquet(chunk.reset_index(drop=True), out)
 
 
@@ -57,10 +64,9 @@ def ingest():
     paths = get_paths()
     src = get_sources()
     rc = get_run_config()
-    log = get_logger("stock_dwh.ingest", paths.logs / "ingest.log")
+    log = get_logger("stock_dwh.ingest", join(paths.logs, "ingest.log"))
 
-    wm_path = paths.repo_root / rc.watermark_path
-    wm_path.parent.mkdir(parents=True, exist_ok=True)
+    wm_path = join(paths.repo_root, rc.watermark_path)
     wm = Watermarks.load(wm_path)
 
     # ---------------- NEWS ----------------
@@ -84,7 +90,7 @@ def ingest():
     raw_news = normalize_news(raw_news)
     raw_news = news_filter(raw_news, wm.news_last_seen_ts)
 
-    write_partitioned(raw_news, paths.bronze / "raw_news")
+    write_partitioned(raw_news, join(paths.bronze, "raw_news"))
     wm.news_last_seen_ts = news_last(raw_news, wm.news_last_seen_ts)
 
     # ---------------- MARKET ----------------
@@ -102,7 +108,7 @@ def ingest():
         raw_px["dt"] = raw_px["ts_utc"].dt.date.astype(str)
         raw_px = mkt_filter(raw_px, wm.market_last_seen_ts)
 
-        write_partitioned(raw_px, paths.bronze / "raw_prices")
+        write_partitioned(raw_px, join(paths.bronze, "raw_prices"))
         wm.market_last_seen_ts = mkt_last(raw_px, wm.market_last_seen_ts)
     else:
         log.warning(f"Market CSV not found at {mkt_path}")
@@ -116,16 +122,16 @@ def ingest():
 # -------------------------------------------------------------------
 def silver():
     paths = get_paths()
-    log = get_logger("stock_dwh.silver", paths.logs / "silver.log")
+    log = get_logger("stock_dwh.silver", join(paths.logs, "silver.log"))
 
-    raw_news = read_parquet(paths.bronze / "raw_news")
-    raw_px = read_parquet(paths.bronze / "raw_prices")
+    raw_news = read_parquet(join(paths.bronze, "raw_news"))
+    raw_px = read_parquet(join(paths.bronze, "raw_prices"))
 
     fact_news = silver_fact_news(raw_news) if not raw_news.empty else pd.DataFrame()
     fact_px = silver_fact_prices(raw_px) if not raw_px.empty else pd.DataFrame()
 
-    write_partitioned(fact_news, paths.silver / "fact_news")
-    write_partitioned(fact_px, paths.silver / "fact_prices")
+    write_partitioned(fact_news, join(paths.silver, "fact_news"))
+    write_partitioned(fact_px, join(paths.silver, "fact_prices"))
 
     log.info("Silver build done.")
 
@@ -135,7 +141,7 @@ def silver():
 # -------------------------------------------------------------------
 def infer():
     paths = get_paths()
-    log = get_logger("stock_dwh.infer", paths.logs / "infer.log")
+    log = get_logger("stock_dwh.infer", join(paths.logs, "infer.log"))
 
     # -------- NIFTY 50 universe --------
     universe_path = Path(
@@ -164,8 +170,8 @@ def infer():
     universe = universe[["ticker"]].drop_duplicates()
 
     # -------- Load silver --------
-    fact_news = read_parquet(paths.silver / "fact_news")
-    fact_px = read_parquet(paths.silver / "fact_prices")
+    fact_news = read_parquet(join(paths.silver, "fact_news"))
+    fact_px = read_parquet(join(paths.silver, "fact_prices"))
 
     if fact_px.empty:
         preds = universe.copy()
@@ -186,7 +192,6 @@ def infer():
             asof = valid["ts_utc"].max()
             feats = build_features(valid, scored, asof)
 
-            # ---------------- RULE-BASED SIGNAL ----------------
             log.info("Running inference in RULE-BASED mode (no ML model).")
 
             preds_valid = feats.copy()
@@ -198,7 +203,7 @@ def infer():
 
     preds["dt"] = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
 
-    write_partitioned(preds, paths.gold / "fact_predictions")
+    write_partitioned(preds, join(paths.gold, "fact_predictions"))
 
     ranked = preds[preds["pred"].notna()].sort_values("pred", ascending=False)
     mart = pd.concat(
@@ -211,7 +216,7 @@ def infer():
 
     write_partitioned(
         mart,
-        paths.gold / "mart_market_snapshot_topbottom",
+        join(paths.gold, "mart_market_snapshot_topbottom"),
         filename="snapshot.parquet",
     )
 
