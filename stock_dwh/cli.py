@@ -8,7 +8,7 @@ import pandas as pd
 from .config import get_paths, get_sources, get_run_config
 from .meta import Watermarks
 from .utils.logging import get_logger
-from .utils.io import write_parquet, read_parquet, write_json
+from .utils.io import write_parquet, read_parquet
 
 from .ingest.news import (
     load_news_csv,
@@ -27,14 +27,17 @@ from .ingest.market import (
 from .transform.silver import silver_fact_news, silver_fact_prices
 from .features.sentiment import finbert_placeholder
 from .features.build import build_features
-from .model.train import train_placeholder
-from .model.infer import load_model, predict
 
 
 # -------------------------------------------------------------------
 # Helpers
 # -------------------------------------------------------------------
-def write_partitioned(df: pd.DataFrame, root: Path, partition_col="dt", filename="part.parquet"):
+def write_partitioned(
+    df: pd.DataFrame,
+    root: Path,
+    partition_col: str = "dt",
+    filename: str = "part.parquet",
+):
     if df.empty:
         return
 
@@ -90,7 +93,6 @@ def ingest():
         log.info(f"Loading market CSV: {mkt_path}")
         raw_px = load_market_csv(mkt_path)
 
-        # normalize timestamp
         if "ts_utc" not in raw_px.columns:
             for c in raw_px.columns:
                 if c.lower() in ("datetime", "date", "timestamp", "time"):
@@ -129,7 +131,7 @@ def silver():
 
 
 # -------------------------------------------------------------------
-# INFER (ENV-BASED NIFTY50)
+# INFER (RULE-BASED, NO MODEL)
 # -------------------------------------------------------------------
 def infer():
     paths = get_paths()
@@ -145,7 +147,6 @@ def infer():
 
     universe = pd.read_csv(universe_path)
 
-    # auto-detect ticker column
     ticker_col = None
     for c in universe.columns:
         if c.lower() in ("ticker", "symbol", "security", "stock symbol"):
@@ -185,23 +186,26 @@ def infer():
             asof = valid["ts_utc"].max()
             feats = build_features(valid, scored, asof)
 
-            model_path = paths.artifacts / "models/champion/model.pkl"
-            model = load_model(model_path)
-            preds_valid = predict(model, feats)
+            # ---------------- RULE-BASED SIGNAL ----------------
+            log.info("Running inference in RULE-BASED mode (no ML model).")
 
-            preds_valid["signal_status"] = "MODEL"
+            preds_valid = feats.copy()
+            preds_valid["pred"] = preds_valid["ret_1d"]
+            preds_valid["signal_status"] = "RULE_BASED"
+
             preds = universe.merge(preds_valid, on="ticker", how="left")
             preds.loc[preds["pred"].isna(), "signal_status"] = "NO_PRICE"
 
-    # preds["dt"] = pd.Timestamp.utcnow().date().astype(str)
     preds["dt"] = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
 
     write_partitioned(preds, paths.gold / "fact_predictions")
 
     ranked = preds[preds["pred"].notna()].sort_values("pred", ascending=False)
     mart = pd.concat(
-        [ranked.head(10).assign(bucket="TOP"),
-         ranked.tail(10).assign(bucket="BOTTOM")],
+        [
+            ranked.head(10).assign(bucket="TOP"),
+            ranked.tail(10).assign(bucket="BOTTOM"),
+        ],
         ignore_index=True,
     )
 
@@ -215,36 +219,11 @@ def infer():
 
 
 # -------------------------------------------------------------------
-# TRAIN
-# -------------------------------------------------------------------
-def train():
-    paths = get_paths()
-    log = get_logger("stock_dwh.train", paths.logs / "train.log")
-
-    fact_px = read_parquet(paths.silver / "fact_prices")
-    if fact_px.empty:
-        log.warning("No prices found. Cannot train.")
-        return
-
-    fact_px = fact_px.sort_values(["ticker", "ts_utc"])
-    fact_px["next_close"] = fact_px.groupby("ticker")["close"].shift(-1)
-    fact_px["target"] = (fact_px["next_close"] / fact_px["close"] - 1.0).fillna(0.0)
-
-    training = fact_px[["ticker", "target"]].dropna()
-
-    model_path = paths.artifacts / "models/champion/model.pkl"
-    meta = train_placeholder(training, "target", model_path)
-    write_json(meta, model_path.with_suffix(".json"))
-
-    log.info("Training done.")
-
-
-# -------------------------------------------------------------------
 # CLI
 # -------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(prog="stock_dwh")
-    parser.add_argument("cmd", choices=["ingest", "silver", "infer", "train"])
+    parser.add_argument("cmd", choices=["ingest", "silver", "infer"])
     args = parser.parse_args()
 
     if args.cmd == "ingest":
@@ -253,8 +232,6 @@ def main():
         silver()
     elif args.cmd == "infer":
         infer()
-    elif args.cmd == "train":
-        train()
 
 
 if __name__ == "__main__":
