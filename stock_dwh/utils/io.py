@@ -40,70 +40,82 @@ def write_parquet(df: pd.DataFrame, path: Union[str, Path]) -> None:
         return
 
     df = _fix_tz(df)
-
     table = pa.Table.from_pandas(df, preserve_index=False)
 
-    if _is_s3(path):
-        fs = _get_fs()
-        with fs.open(str(path), "wb") as f:
-            pq.write_table(table, f)
-    else:
+    # ---- LOCAL FIRST ----
+    path_str = str(path)
+    if not _is_s3(path):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         pq.write_table(table, path)
+        return
+
+    # ---- S3 ----
+    fs = _get_fs()
+    with fs.open(path_str, "wb") as f:
+        pq.write_table(table, f)
 
 
 def read_parquet(path: Union[str, Path]) -> pd.DataFrame:
-    """
-    Reads BOTH:
-    - single parquet file
-    - partitioned parquet directory (dataset)
-    """
+    path_str = str(path)
 
+    # -------------------------------------------------
+    # 1️⃣ LOCAL FILESYSTEM ALWAYS HAS PRIORITY
+    # -------------------------------------------------
+    local_path = Path(path)
+    if local_path.exists():
+        # Directory (partitioned parquet)
+        if local_path.is_dir():
+            return pq.ParquetDataset(local_path).read().to_pandas()
+
+        # Single parquet file
+        return pq.read_table(local_path).to_pandas()
+
+    # -------------------------------------------------
+    # 2️⃣ ONLY THEN TRY S3 (explicit s3://)
+    # -------------------------------------------------
     if _is_s3(path):
         fs = _get_fs()
 
-        # DIRECTORY (partitioned dataset)
-        if fs.isdir(str(path)):
-            dataset = pq.ParquetDataset(str(path), filesystem=fs)
-            return dataset.read().to_pandas()
+        # Directory (dataset)
+        if fs.isdir(path_str):
+            return pq.ParquetDataset(path_str, filesystem=fs).read().to_pandas()
 
-        # SINGLE FILE
-        with fs.open(str(path), "rb") as f:
+        # Single file
+        with fs.open(path_str, "rb") as f:
             return pq.read_table(f).to_pandas()
 
-    else:
-        path = Path(path)
-
-        # DIRECTORY (partitioned dataset)
-        if path.is_dir():
-            dataset = pq.ParquetDataset(path)
-            return dataset.read().to_pandas()
-
-        # SINGLE FILE
-        return pq.read_table(path).to_pandas()
+    # -------------------------------------------------
+    # 3️⃣ Nothing found
+    # -------------------------------------------------
+    raise FileNotFoundError(path_str)
 
 
 # ---------------------------------------------------------
 # JSON IO
 # ---------------------------------------------------------
 def write_json(obj: dict, path: Union[str, Path]) -> None:
-    if _is_s3(path):
-        fs = _get_fs()
-        with fs.open(str(path), "w") as f:
-            json.dump(obj, f, indent=2)
-    else:
+    path_str = str(path)
+
+    if not _is_s3(path):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
             json.dump(obj, f, indent=2)
+        return
+
+    fs = _get_fs()
+    with fs.open(path_str, "w") as f:
+        json.dump(obj, f, indent=2)
 
 
 def read_json(path: Union[str, Path]) -> dict:
-    if _is_s3(path):
-        fs = _get_fs()
-        with fs.open(str(path), "r") as f:
+    path_str = str(path)
+
+    if not _is_s3(path):
+        with open(path_str, "r") as f:
             return json.load(f)
-    else:
-        with open(path, "r") as f:
-            return json.load(f)
+
+    fs = _get_fs()
+    with fs.open(path_str, "r") as f:
+        return json.load(f)
