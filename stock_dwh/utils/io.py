@@ -22,13 +22,12 @@ def _get_fs():
 
 
 # ---------------------------------------------------------
-# INTERNAL: fix tz-aware datetimes (ROOT CAUSE FIX)
+# Internal: fix tz-aware datetimes
 # ---------------------------------------------------------
 def _fix_tz(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     for col in df.columns:
         if pd.api.types.is_datetime64tz_dtype(df[col]):
-            # convert → UTC → drop timezone
             df[col] = df[col].dt.tz_convert("UTC").dt.tz_localize(None)
     return df
 
@@ -37,20 +36,12 @@ def _fix_tz(df: pd.DataFrame) -> pd.DataFrame:
 # Parquet IO
 # ---------------------------------------------------------
 def write_parquet(df: pd.DataFrame, path: Union[str, Path]) -> None:
-    """
-    Write DataFrame to Parquet (local or S3).
-    FIXED: handles datetime64[ns, UTC]
-    """
-
     if df is None or df.empty:
         return
 
     df = _fix_tz(df)
 
-    table = pa.Table.from_pandas(
-        df,
-        preserve_index=False
-    )
+    table = pa.Table.from_pandas(df, preserve_index=False)
 
     if _is_s3(path):
         fs = _get_fs()
@@ -63,11 +54,33 @@ def write_parquet(df: pd.DataFrame, path: Union[str, Path]) -> None:
 
 
 def read_parquet(path: Union[str, Path]) -> pd.DataFrame:
+    """
+    Reads BOTH:
+    - single parquet file
+    - partitioned parquet directory (dataset)
+    """
+
     if _is_s3(path):
         fs = _get_fs()
+
+        # DIRECTORY (partitioned dataset)
+        if fs.isdir(str(path)):
+            dataset = pq.ParquetDataset(str(path), filesystem=fs)
+            return dataset.read().to_pandas()
+
+        # SINGLE FILE
         with fs.open(str(path), "rb") as f:
             return pq.read_table(f).to_pandas()
+
     else:
+        path = Path(path)
+
+        # DIRECTORY (partitioned dataset)
+        if path.is_dir():
+            dataset = pq.ParquetDataset(path)
+            return dataset.read().to_pandas()
+
+        # SINGLE FILE
         return pq.read_table(path).to_pandas()
 
 
