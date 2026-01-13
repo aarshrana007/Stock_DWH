@@ -1,14 +1,21 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
 import os
 
 
+# -------------------------------------------------
+# Helpers
+# -------------------------------------------------
 def _env(name: str, default: str) -> str:
     v = os.getenv(name)
     return v if v not in (None, "") else default
 
 
+# -------------------------------------------------
+# Paths
+# -------------------------------------------------
 @dataclass(frozen=True)
 class Paths:
     repo_root: Path
@@ -18,15 +25,28 @@ class Paths:
 
     @property
     def bronze(self):
-        return f"{self.warehouse}/bronze"
+        # ✅ Path-safe (local) + string-safe (S3)
+        return (
+            f"{self.warehouse}/bronze"
+            if isinstance(self.warehouse, str)
+            else self.warehouse / "bronze"
+        )
 
     @property
     def silver(self):
-        return f"{self.warehouse}/silver"
+        return (
+            f"{self.warehouse}/silver"
+            if isinstance(self.warehouse, str)
+            else self.warehouse / "silver"
+        )
 
     @property
     def gold(self):
-        return f"{self.warehouse}/gold"
+        return (
+            f"{self.warehouse}/gold"
+            if isinstance(self.warehouse, str)
+            else self.warehouse / "gold"
+        )
 
 
 def get_paths(repo_root: str | Path | None = None) -> Paths:
@@ -40,7 +60,9 @@ def get_paths(repo_root: str | Path | None = None) -> Paths:
     artifacts_env = _env("STOCK_DWH_ARTIFACTS", str(root / "artifacts"))
     logs_env = _env("STOCK_DWH_LOGS", str(root / "logs"))
 
-    # 🚨 CRITICAL: S3 paths MUST remain strings
+    # 🚨 CRITICAL RULE (unchanged):
+    # - S3 paths MUST remain strings
+    # - Local paths MUST be Path
     warehouse = (
         warehouse_env
         if warehouse_env.startswith("s3://")
